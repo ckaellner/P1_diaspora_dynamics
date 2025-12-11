@@ -1,0 +1,3153 @@
+---
+title: "Migration Dynamics"
+subtitle: "Analysing arrival/exit dynamics of migrants in and to Austria"
+author: "Carsten Källner"
+date: "2024-10-22"
+output: 
+  html_document:
+    toc: TRUE
+---
+# Input
+## Packages
+```{r Installation of Packages, include = FALSE}
+# Install missing packages and load all at once
+invisible(lapply(
+  c("RPostgreSQL", "DBI", "tibble", "dplyr", "tidyr", "ggplot2", 
+    "countrycode", "reshape2", "plotly", "ggrepel", "sf", "rmapshaper", 
+    "biscale", "classInt", "cowplot", "hexbin", "spdep", "sp", "lmtest", 
+    "data.table", "purrr", "stringr", "scales"),
+  function(pkg) {
+    if (!pkg %in% installed.packages()[, "Package"]) install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+))
+```
+## Functions
+### General Calculations
+```{r Functions for general base calculations, include = FALSE}
+## Euclidian Distance
+f_euclidean_distance <- function(matrix1, matrix2, absolute = TRUE){
+  euclidean_distance <- c()
+  
+  for (i in colnames(matrix1)){
+    q1 <- matrix1[1, i]
+    q2 <- matrix1[2, i]
+    
+    p1 <- matrix2[1, i]
+    p2 <- matrix2[2, i]
+    
+    if (absolute == FALSE){
+      q1 <- (q1/sum(q1))
+      q2 <- (q2/sum(q2))
+      
+      p1 <- (p1/sum(p1))
+      p2 <- (p2/sum(p2))
+    }
+    
+    euclidean_distance[i] <- sqrt((q1 - p1)^2 + (q2 - p2)^2)
+    rm(list = c("i", "q1", "q2", "p1", "p2"))
+  }
+  
+  return(euclidean_distance)
+}
+## Similarity by Euclidian Distance
+f_similarity_euclidian <- function(countries, matrix = list_municipality_skellam_ext){
+  similarity_euclidian <- matrix(0,
+                                 nrow = length(countries), 
+                                 ncol = length(countries), 
+                                 dimnames = list(countries, countries))
+  
+  for (i in countries){
+    for (j in countries){
+      similarity_euclidian[i, j] <- f_euclidean_distance(
+        matrix[[i]], 
+        matrix[[j]]
+      ) %>% sum()
+      
+      rm(j)
+    }
+    rm(i)
+  }
+  return(similarity_euclidian)
+}
+## Identity crossing
+f_identity_crossing <- function(observed_units = municipalities$municipality_code, countries = country_codes, matrix = list_municipalities_arrivals){
+  identity_crossings <- list()
+
+  for (i in countries){
+    identity_crossings[[i]] <- matrix(0, 
+                                      nrow = length(unique(observed_units)), 
+                                      ncol = length(countries), 
+                                      dimnames = list(
+                                        unique(observed_units),
+                                        countries
+                                      ))
+    
+    for (j in countries){
+      identity_crossings[[i]][, j] <- mapply(function(x, y) (x < 0) != (y < 0),
+                                             x = rowsum(matrix[[i]][3, ], observed_units),
+                                             y = rowsum(matrix[[j]][3, ], observed_units)) %>% as.integer()
+      
+      rm("j")
+    }
+    rm("i")
+  }
+  return(identity_crossings)
+}
+## Minimize error to fit Poisson distribution to a vector
+f_poisson_fitting <- function(vector){
+  n <- length(vector)
+  t <- 1:n
+  M_t <- cumsum(vector)
+  
+  lambda_hat <- (6 * sum(t * M_t)) / (n * (n + 1) * (2 * n + 1))
+  
+  return(lambda_hat)
+}
+## Poisson Confidence Intervall
+f_poisson_fitness <- function(vector, alpha = 0.01){
+  # Inputs
+  lambda_hat <- f_poisson_fitting(vector)
+  t <- length(vector)
+  observed <- sum(vector)
+  expected <- lambda_hat * t
+  z <- qnorm(1 - (alpha/2))
+  
+  # Confidence intervalls
+  lower_ci <- expected - z * sqrt(expected)
+  upper_ci <- expected + z * sqrt(expected)
+  
+  # Result
+  result <- c(observed = observed, 
+              expected = expected, 
+              lower_ci = lower_ci, 
+              upper_ci = upper_ci)
+  
+  print(result)
+  invisible(result)
+  
+}
+```
+### Matrices
+```{r Functions for matrix generation, include = FALSE}
+## Generate Arrival/Exit Matrices
+f_generate_matrix <- function(observed.unit = "all_combined", filter = "all_combined", type = "arrivals", is.internal = FALSE, redistribute.outliers = FALSE, filter.camp = FALSE, filter.births = TRUE, filter.deaths = TRUE, data = filtered_data){
+  
+  if (is.internal) {
+    data <- inter_area_movement %>% 
+      filter(municipality_code != old_municipality)
+  }
+  
+  # Step 1: Filter for type c("arrivals", "exits", "internal")
+  if (type == "arrivals" & !is.internal){
+    data <- data %>%
+      filter(if_all(-all_of(c("update_last_date", "asylum_status")), ~ !is.na(.))) %>% 
+      arrange(person_id_ifa_hash, update_first_date) %>%
+      distinct(person_id_ifa_hash, .keep_all = TRUE)
+  } else if (type == "exits" & !is.internal){
+    data <- data %>%
+      filter(if_all(-all_of("update_last_date"), ~ !is.na(.))) %>% 
+      arrange(person_id_ifa_hash, desc(update_first_date)) %>%
+      distinct(person_id_ifa_hash, .keep_all = TRUE) %>% 
+      filter(is_current == FALSE) %>% 
+      select(-update_first_date) %>% 
+      rename("update_first_date" = update_last_date)
+  } else if (type == "exits" & is.internal){
+    data <- data %>%
+      select(-municipality_code) %>%
+      rename("municipality_code" = old_municipality)
+  }
+  
+  # Step 2: Filter for filter.camp & drop.births.deaths
+  if (filter.camp){
+    data <- data %>% 
+      filter(is_camp == 0)
+  }
+  
+  if (filter.births){
+    data <- data %>% 
+      filter(age != 0)
+  }
+  
+  if (filter.deaths & type == "exits"){
+    data <- data %>% 
+      filter(year_of_death == -1)
+  }
+  
+  # Step 3: Filter municipalities not in official register
+  if (filter == "municipality_code"){
+    data <- data %>% filter(!municipality_code %in% setdiff(municipalities$municipality_code, unique(data$municipality_code)))
+  }
+  
+  # Step 4: Filter dataset
+  filter_data <- function(data, filter_col) {
+    data %>%
+      filter(.[[filter_col]] %in% observed.unit)
+  }
+  
+  if (all(observed.unit != "all_combined")){
+    # Step a: Find which column `filter` belongs to
+    matching_col <- keep(names(data), ~ all(observed.unit %in% unique(data[[.x]])))
+    
+    if (length(matching_col) == 0){
+      stop("Check if 'observed.unit' is present in the dataset.")
+    }
+    
+    #Step b: Apply the filtering and transformation if a match is found
+    if (length(matching_col) > 0) {
+      selected_col <- matching_col[1]  # Use the first matching column
+      data <- filter_data(data = data, filter_col = selected_col)
+    }
+    
+    # Step c: Converse dataset to matrix
+    if (!filter %in% names(data) & filter != "all_combined"){
+      stop("Check if 'filter' is present in dataset.")
+    } else if (!filter %in% names(data) & filter == "all_combined"){
+      data <- f_table_to_full_matrix(data %>% {table(.[["update_first_date"]])})
+      rownames(data) <- observed.unit
+    } else {
+      data <- f_table_to_full_matrix(data %>% {table(.[[filter]], .[["update_first_date"]])})
+    }
+    
+  } else if (observed.unit == "all_combined" & filter == "municipality_code"){
+    data <- f_table_to_full_matrix(data %>% {table(.[[filter]], .[["update_first_date"]])})
+
+  } else if (filter == "all_combined"){
+    data <- data %>%
+      select(update_first_date) %>% table() %>%
+      as.matrix() %>% t()
+  } else if (filter != "all_combined"){
+    data <- data %>% 
+      {table(.[[filter]], .[["update_first_date"]])} %>% 
+      f_table_to_full_matrix()
+  }
+
+  # Step 4: Redistribute if wanted & return matrix
+  if (redistribute.outliers){
+    data <- data %>% f_redistribute_outliers()
+  }
+  
+  # Step 5: Initiate full matrix & data matrix into full matrix
+  if (all(dim(data) > 1) & length(dim(data)) > 1){
+    matrix <- matrix(0, 
+                      nrow = length(unique(first_main_residence[[filter]], na.rm = TRUE)), 
+                      ncol = seq(min(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          max(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          by = "day") %>% length(), 
+                      dimnames = list(unique(first_main_residence[[filter]], na.rm = TRUE) %>% sort(na.last = FALSE), 
+                                      seq(min(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          max(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          by = "day") %>% as.character()))
+    
+    if (filter == "state_urbanisation"){
+      data <- data[rownames(matrix), ]
+    }
+    
+    matrix[rownames(data), colnames(data)] <- data
+    
+    matrix <- matrix[!is.na(rownames(matrix)), ]
+    
+  } else if (!all(dim(data) > 1)){
+    matrix <- matrix(0, 
+                     nrow = 1, 
+                     ncol = seq(min(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          max(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          by = "day") %>% length(),
+                     dimnames = list(observed.unit,
+                                     seq(min(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          max(first_main_residence$update_first_date, na.rm = TRUE), 
+                                          by = "day") %>% as.character()))
+    
+    matrix[, colnames(data)] <- data
+  }
+  
+  # Step 6: Return Matrix
+  return(matrix)
+  
+}
+## Conversion of a table-function object into a table containing all dates (incl. weekends)
+f_table_to_full_matrix <- function(tabled_dataset) {
+  # Check if "all_combined"
+  if (length(dim(tabled_dataset)) == 1){
+    tabled_dataset <- tabled_dataset %>% as.matrix() %>% t()
+    rownames(tabled_dataset) <- "all_combined"
+  }
+  
+  # Helper variable for the dates of the matrix
+  matrix_dates <- as.Date(as.Date(colnames(tabled_dataset)[1]):as.Date(colnames(tabled_dataset) %>% tail(1)))
+  
+  # Initialize full_matrix
+  full_matrix <- matrix(0, nrow = length(rownames(tabled_dataset)), 
+                        ncol = length(matrix_dates), 
+                        dimnames = list(rownames(tabled_dataset), as.character(matrix_dates)))
+  
+  # Convert input dataset to a standard matrix (if not already)
+  tabled_dataset <- as.matrix(tabled_dataset)
+  
+  # Determine intersecting rows and columns
+  intersect_rows <- intersect(rownames(full_matrix), rownames(tabled_dataset))
+  intersect_cols <- intersect(colnames(full_matrix), colnames(tabled_dataset))
+  
+  # Update full_matrix with values from tabled_dataset
+  full_matrix[match(intersect_rows, rownames(full_matrix)), 
+              match(intersect_cols, colnames(full_matrix))] <- 
+    tabled_dataset[match(intersect_rows, rownames(tabled_dataset)), 
+                   match(intersect_cols, colnames(tabled_dataset))]
+  
+  return(full_matrix)
+}
+## Redistribute Outliers
+f_redistribute_outliers <- function(matrix, outlier_value = 5){
+  new_matrix <- matrix
+  
+  for (i in 1:nrow(new_matrix)){
+    
+    if (sum(matrix[i, ]) == 0){
+      next
+    }
+    
+    if (as.integer(sum(matrix[i, ] > mean(matrix[i, matrix[i, ] > 0]) * outlier_value)) == 0){
+      next
+    }
+    
+    for (j in 1:ncol(new_matrix)){
+      
+      # Check if outlier value
+      if (matrix[i, j] > mean(matrix[i, matrix[i, ] > 0]) * outlier_value){
+        
+        diff <- matrix[i, j] - round(mean(matrix[i, ]))
+        new_matrix[i, j] <- round(mean(matrix[i, ]))
+        
+        for (k in 1:diff){
+          sample_col <- sample(j, 1)
+          new_matrix[i, sample_col] <- new_matrix[i, sample_col] + 1
+        }
+      }
+    }
+  }
+  return(new_matrix)
+}
+```
+### Analysis
+```{r Functions, include = FALSE}
+## Analysis of arrivals and exits
+f_skellam_analysis <- function(arrival_matrix, exit_matrix){
+  
+  # Step 1: Check for dimensions of analysis matrices & calculate Skellam parameters
+  if (!is.numeric(nrow(arrival_matrix))){
+     matrix <- rbind(
+       f_poisson_fitting(arrival_matrix),
+       f_poisson_fitting(exit_matrix),
+       f_poisson_fitting(arrival_matrix) -
+         f_poisson_fitting(exit_matrix)
+       )
+  } else {
+    matrix <- rbind(
+      apply(arrival_matrix, 1, f_poisson_fitting),
+      apply(exit_matrix, 1, f_poisson_fitting),
+      apply(arrival_matrix, 1, f_poisson_fitting) - 
+        apply(exit_matrix, 1, f_poisson_fitting)
+      )
+  }
+  
+  # Step 2: Name dimensions of matrix
+  dimnames(matrix) <- list(c("lambda", "gamma", "net_migration"),
+                           rownames(arrival_matrix))
+  
+  # Step 3: Return matrix
+  return(matrix)
+}
+## Pull and Exit Rate
+f_pull_push_rate <- function(observed.unit = "all_combined", filter = "singular_citizenship", years = c("2023", "2024"), data = first_main_residence){
+  # Step 1: Generate Matrix
+  arrival_data <- f_generate_matrix(observed.unit = observed.unit,
+                                    filter = "singular_citizenship",
+                                    type = "arrivals", 
+                                    filter.camp = FALSE, 
+                                    filter.births = TRUE, 
+                                    filter.deaths = TRUE,
+                                    data = data) %>% 
+    .[, year(colnames(.)) %in% years]
+  
+  exit_data <- f_generate_matrix(observed.unit = observed.unit,
+                                 filter = "singular_citizenship",
+                                 type = "exits",
+                                 filter.camp = FALSE,
+                                 filter.births = TRUE,
+                                 filter.deaths = TRUE, 
+                                 data = data) %>%
+    .[, year(colnames(.)) %in% years]
+  
+  if (filter == "singular_citizenship"){
+    arrival_data <- arrival_data[top_25_diaspora, ]
+    exit_data <- exit_data[top_25_diaspora, ]
+  }
+  
+  # Step 2: Diaspora Size
+  diaspora_size <- {{f_generate_matrix(filter = filter, data = filtered_data, filter.births = FALSE) %>% 
+      {.[, year(colnames(.)) %in% seq(from = 2022, to = as.integer(years[1]) - 1, by = 1)]}} - 
+    {f_generate_matrix(filter = filter, type = "exits", filter.deaths = FALSE, data = filtered_data) %>%
+        {.[, year(colnames(.)) %in% seq(from = 2022, to = as.integer(years[1]) - 1, by = 1)]}}}
+
+  # Step 3: Calculate pull-rates
+  pull_rate <- (sum(arrival_data) * sum(diaspora_size))/(ncol(arrival_data) * sum(diaspora_size)^2)
+  
+  # Step 4: Calculate push-rates
+  push_rate <- (sum(exit_data) * sum(diaspora_size))/(ncol(exit_data) * sum(diaspora_size)^2)
+  
+  return(c("Diaspora-Size" = sum(diaspora_size),
+           "Pull-Rate" = pull_rate, 
+           "Push-Rate" = push_rate))
+}
+## Arrival/exit analysis for shifting windows
+f_skellam_shifting <- function(arrival_matrix, 
+                               exit_matrix,
+                               shifting_size = 70, 
+                               step_size = 1){
+  # Step 1: Initiate helper values
+  observed.unit <- rownames(arrival_matrix)
+  time_sequence <- 1:ncol(arrival_matrix)
+  
+  # Step 2: Determine window borders
+  first_t <- (seq(1, floor((length(time_sequence)-shifting_size)/step_size), by = 1) * step_size) - (step_size - 1)
+  last_t <- ((seq(1, floor((length(time_sequence)-shifting_size)/step_size), by = 1) - 1) * step_size) + (shifting_size)
+  
+  # Step 3: Calculate result for arrivals & exits
+  result_arrivals <- if(all(dim(arrival_matrix) > 1)){
+                   apply(arrival_matrix[observed.unit, time_sequence], 1, f_skellam_shifting_vector, first_t, last_t, shifting_size)
+  } else { f_skellam_shifting_vector(arrival_matrix[observed.unit, time_sequence], first_t, last_t, shifting_size) }
+
+  result_exits <- if(all(dim(exit_matrix) > 1)){
+                   apply(exit_matrix[observed.unit, time_sequence], 1, f_skellam_shifting_vector, first_t, last_t, shifting_size)
+  } else { f_skellam_shifting_vector(exit_matrix[observed.unit, time_sequence], first_t, last_t, shifting_size) }
+  
+  # Step 4: Return results
+  results <- list(start_date = colnames(arrival_matrix)[first_t],
+                  lambda = t(result_arrivals),
+                  gamma = t(result_exits))
+  
+  return(results)
+}
+
+f_shifting <- function(observed.unit = "all_combined", shifting.size = 70, step.size = 1, date.format = "%Y-%m-%d", beta.range = c(0, 0.1), beta.increments = 100){
+  # Step 1: Optimal Beta
+  optimal_beta <- f_optimal_beta(observed.unit = observed.unit, beta.range = beta.range, beta.increments = beta.increments)
+  
+  beta <- c("arrivals" = which.min(optimal_beta[1, ]) %>% names() %>% as.numeric(), 
+            "exits" = which.min(optimal_beta[2, ]) %>% names() %>% as.numeric())
+  beta_arrivals <- exp(beta[1] * seq(from = 0, to = shifting.size - 1, by = 1))/sum(exp(beta[1] * seq(from = 0, to = shifting.size - 1, by = 1)))
+  beta_exits <- exp(beta[2] * seq(from = 0, to = shifting.size - 1, by = 1))/sum(exp(beta[2] * seq(from = 0, to = shifting.size - 1, by = 1)))
+   
+  # Step 1: Initiate matrices
+  arrival_matrix <- f_generate_matrix(observed.unit = observed.unit)[, -1, drop = FALSE]
+  exit_matrix <- f_generate_matrix(observed.unit = observed.unit, type = "exits")[, -1, drop = FALSE]
+  
+  # Step 2: Adapt to chosen date Format
+  adjust_day_length <- function(days, date.format) {
+    switch(date.format, 
+      "%Y-%m-%d" = days,
+      "%Y-%W"    = ceiling(days / 7),
+      "%Y-%m"    = ceiling(days / 30),
+      stop("Unsupported date format!")
+      )
+  }
+  
+  if (date.format != "%Y-%m-%d"){
+    shifting.size <- shifting.size/{table(arrival_matrix %>% colnames() %>% as.Date() %>% format(date.format)) %>% mean() %>% round()}
+    
+    arrival_matrix <- arrival_matrix %>% {tapply(., colnames(.) %>% as.Date() %>% format(date.format), sum)}
+    exit_matrix <- exit_matrix %>% {tapply(., colnames(.) %>% as.Date() %>% format(date.format), sum)}
+  } else {
+    arrival_matrix <- arrival_matrix[1, ]
+    exit_matrix <- exit_matrix[1, ]
+  }
+  
+  # Step 3: Calculate arrivals and exits for shifting windows
+  shifting_arrivals <- sapply(seq(from = 1, to = length(arrival_matrix) - shifting.size, by = step.size),
+                              function(i){
+                                sum(beta_arrivals * arrival_matrix[i:(i + shifting.size - 1)])
+                              })
+  
+  skellam_arrivals <- sapply(seq(from = 1, to = length(arrival_matrix) - shifting.size, by = step.size),
+                              function(i){
+                                f_poisson_fitting(arrival_matrix[i:(i + shifting.size - 1)])
+                              })
+  
+  shifting_exits <- sapply(seq(from = 1, to = length(exit_matrix) - shifting.size, by = step.size),
+                              function(i){
+                                sum(beta_exits * exit_matrix[i:(i + shifting.size - 1)])
+                              })
+  
+  skellam_exits <- sapply(seq(from = 1, to = length(exit_matrix) - shifting.size, by = step.size),
+                              function(i){
+                                f_poisson_fitting(exit_matrix[i:(i + shifting.size - 1)])
+                              })
+  
+  # Step 4: Return results
+  arrivals <- rbind("t" = seq(from = 1, to = length(shifting_arrivals) - 1, by = 1),
+                    "arrivals" = arrival_matrix[(1 + shifting.size):length(arrival_matrix)],
+                    "arrivals_weighted" = shifting_arrivals,
+                    "arrivals_poisson" = skellam_arrivals)
+  
+  exits <- rbind("t" = seq(from = 1, to = length(shifting_exits) - 1, by = 1),
+                 "exits" = exit_matrix[(1 + shifting.size):length(exit_matrix)],
+                 "exits_weighted" = shifting_exits,
+                 "exits_poisson" = skellam_exits)
+  
+  return(list("arrivals" = arrivals, 
+              "exits" = exits, 
+              "differences" = rbind("arrivals" = diff(shifting_arrivals)/head(shifting_arrivals, -1), 
+                                    "exits" = diff(shifting_exits)/head(shifting_exits, -1))))
+}
+## Selecting subvector for the Skellam anaylsis
+f_skellam_shifting_vector <- function(vector, first_t, last_t, shifting_size){
+  shifting_matrix <- matrix(t(vector[c(sapply(1:length(first_t), function(i) first_t[i]:last_t[i]))]), ncol = shifting_size, byrow = TRUE)
+  
+  return(apply(shifting_matrix, 1, f_poisson_fitting))
+}
+## Wighted skellam rates
+f_skellam_weighted <- function(arrival_matrix = f_generate_matrix() %>% .[, year(colnames(.)) %in% c("2023", "2024")],
+                               exit_matrix = f_generate_matrix(type = "exits") %>% .[, year(colnames(.)) %in% c("2023", "2024")],
+                               beta_weight = 0.05, 
+                               shifting_size = 70, 
+                               step_size = 1){
+
+  results <- f_skellam_shifting(arrival_matrix = arrival_matrix,
+                               exit_matrix = exit_matrix,
+                               shifting_size = shifting_size,
+                               step_size = step_size)
+  
+
+  
+  weight_vector <- 1/exp(beta_weight * (ncol(results[[1]]) - 0:(ncol(results[[1]]) - 1)))
+  
+  rates <- lapply(results, function(matrix) rowSums(matrix * matrix(weight_vector, 
+                                                                    nrow = nrow(matrix), 
+                                                                    ncol = ncol(matrix), 
+                                                                    byrow = TRUE))/sum(weight_vector))
+  
+  return(rbind(do.call(rbind, rates), "net_migration" = do.call(rbind, rates)[1, ] - do.call(rbind, rates)[2, ]))
+}
+
+f_find_beta <- function(observed.unit = "all_combined", beta.range = c(0, 1), beta.threshold = 3, beta.increments = 1000, projection.days = 100, beta.random = TRUE){
+  # Step 1: Initiate beta & storage for results
+  if (beta.random){
+    beta <- runif(n = beta.increments, min = beta.range[1], max = beta.range[2]) %>% sort()
+    beta.threshold <- beta.increments
+  } else {
+    beta <- seq(beta.range[1], beta.range[2], by = beta.range[2]/beta.increments)
+  }
+  
+  skellam_matrix <- matrix(0, 
+                         nrow = 3, 
+                         ncol = length(beta), 
+                         dimnames = list(c("Arrivals", "Exits", "Net-Migration"), 
+                                         beta))
+  
+  estimation_matrix <- matrix(0,
+                              nrow = 2,
+                              ncol = length(beta),
+                              dimnames = list(c("Arrivals", "Exits"),
+                                              beta))
+  
+  error_matrix <- matrix(0, 
+                       nrow = 2, 
+                       ncol = length(beta), 
+                       dimnames = list(c("Arrivals", "Exits"), 
+                                       beta))
+
+  beta_trend <- 0
+  
+  # Step 2: Search for filter-column
+  process_data <- function(data, filter_col, arrival_or_exit) {
+    f_table_to_full_matrix(data %>%
+                             filter(.[[filter_col]] %in% observed.unit) %>%
+                             {table(.[[filter_col]], .[[arrival_or_exit]])}) %>%
+    f_redistribute_outliers()
+  }
+  
+  # Step 3: Identify the matching column dynamically
+  if (observed.unit != "all_combined"){
+    columns_to_check <- names(first_main_residence)
+    
+    # Find which column `observed.unit` belongs to
+    matching_col <- keep(columns_to_check, ~ all(observed.unit %in% unique(first_main_residence[[.x]])))
+    filter <- matching_col[1]
+  } else {
+    filter <- "all_combined"
+  }
+  
+  # Step 4: Construct arrival and exit matrix
+  arrival_matrix <- f_generate_matrix(observed.unit, filter = filter) %>% .[observed.unit, -1, drop = FALSE] %>% as.matrix()
+  if (ncol(arrival_matrix) == 1){
+    arrival_matrix <- arrival_matrix %>% t()
+  }
+  
+  exit_matrix <- f_generate_matrix(observed.unit, filter = filter, type = "exits") %>% .[observed.unit, -1, drop = FALSE] %>% as.matrix()
+  if (ncol(exit_matrix) == 1){
+    exit_matrix <- exit_matrix %>% t()
+  }
+  
+  rownames(arrival_matrix) <- observed.unit
+  rownames(exit_matrix) <- observed.unit
+  
+  trainings_days <- ncol(arrival_matrix) - projection.days
+  
+  # Step 5: Split training from projection dataset
+  projection_arrival <- arrival_matrix[, (trainings_days + 1):(trainings_days + projection.days), drop = FALSE]
+  projection_exit <- exit_matrix[, (trainings_days + 1):(trainings_days + projection.days), drop = FALSE]
+  
+  training_arrival <- arrival_matrix[, 1:trainings_days, drop = FALSE]
+  training_exit <- exit_matrix[, 1:trainings_days, drop = FALSE]
+  
+  # Step 6: Loop to go through results
+  iteration <- 0
+  
+  for (i in beta){
+    # Step a: Calculate weighted Skellam
+    skellam_analysis <- f_skellam_weighted(arrival_matrix = training_arrival, 
+                                           exit_matrix = training_exit, 
+                                           beta_weight = i)
+    
+    skellam_matrix[, as.character(i)] <- skellam_analysis
+    
+    estimation_matrix[, as.character(i)] <- c(skellam_analysis[1] * projection.days, skellam_analysis[2] * projection.days)
+    
+    # Step b: Calculate prediction error
+    error_matrix[, as.character(i)] <- c(
+      (rowSums(projection_arrival) - skellam_analysis[1] * projection.days)^2, 
+      (rowSums(projection_exit) - skellam_analysis[2] * projection.days)^2
+    )
+    
+    # Step c: Check if prediction error is increasing
+    if (iteration >= 1) {
+        prev_beta <- beta[iteration]
+        
+        # Ensure prev_beta exists before checking error conditions
+        if (error_matrix[1, as.character(i)] > error_matrix[1, as.character(prev_beta)] &&
+            error_matrix[2, as.character(i)] > error_matrix[2, as.character(prev_beta)]) {
+              beta_trend <- beta_trend + 1
+              if (beta_trend == beta.threshold) {
+                print(paste("Optimal beta: ", beta[iteration - beta.threshold + 1]))
+                break
+          }
+        }
+      }
+    # Step d: Set iteration counter to iteration + 1
+    iteration <- iteration + 1
+  }
+  
+  if (beta.threshold == beta.increments){
+    print(paste("Optimal beta arrivals: ", 
+                colnames(error_matrix)[which.min(error_matrix[1, ])] %>% as.integer() %>% signif(3), 
+                "; Optimal beta exits: ", 
+                colnames(error_matrix)[which.min(error_matrix[2, ])] %>% as.integer() %>% signif(3),
+                sep = ""))
+  }
+  
+  # Step 7: Return results
+  return(list("arrivals" = arrival_matrix, 
+              "exits" = exit_matrix,
+              "training_arrival" = training_arrival, 
+              "training_exit" = training_arrival,
+              "projection_arrival" = projection_arrival, 
+              "projection_exit" = projection_exit,
+              "skellam_results" = skellam_matrix,
+              "estimations" = estimation_matrix,
+              "errors" = error_matrix))
+}
+f_find_window <- function(observed.unit = "all_combined", share.range = c(0, 1), share.increments = 10, projection.days = 100, error.tolerance = 0.05){
+  # Step 1: Determine share
+  shares <- sample(1:(max(time_all) - projection.days), size = share.increments) %>% sort()
+    
+  skellam_matrix <- matrix(0, 
+                           nrow = 3,
+                           ncol = length(shares),
+                           dimnames = list(c("Arrivals", "Exits", "Net-Migration"),
+                                           shares))
+  
+  estimation_matrix <- matrix(0,
+                              nrow = 2,
+                              ncol = length(shares),
+                              dimnames = list(c("Arrivals", "Exits"),
+                                              shares))
+  
+  error_matrix <- matrix(0, 
+                       nrow = 2, 
+                       ncol = length(shares), 
+                       dimnames = list(c("Arrivals", "Exits"), 
+                                       shares))
+  
+  # Step 2: Search for filter-column
+  process_data <- function(data, filter_col, arrival_or_exit) {
+    f_table_to_full_matrix(data %>%
+                             filter(.[[filter_col]] %in% observed.unit) %>%
+                             {table(.[[filter_col]], .[[arrival_or_exit]])}) %>%
+    f_redistribute_outliers()
+  }
+  
+  # Step 3: Identify the matching column dynamically
+  if (observed.unit != "all_combined"){
+    columns_to_check <- names(first_main_residence)
+    
+    # Find which column `observed.unit` belongs to
+    matching_col <- keep(columns_to_check, ~ all(observed.unit %in% unique(first_main_residence[[.x]])))
+    filter <- matching_col[1]
+  } else {
+    filter <- "all_combined"
+  }
+  
+  # Step 4: Construct arrival and exit matrix
+  arrival_matrix <- f_generate_matrix(observed.unit, filter = filter) %>% .[observed.unit, -1, drop = FALSE] %>% as.matrix()
+  if (ncol(arrival_matrix) == 1){
+    arrival_matrix <- arrival_matrix %>% t()
+  }
+  
+  exit_matrix <- f_generate_matrix(observed.unit, filter = filter, type = "exits") %>% .[observed.unit, -1, drop = FALSE] %>% as.matrix()
+  if (ncol(exit_matrix) == 1){
+    exit_matrix <- exit_matrix %>% t()
+  }
+  
+  rownames(arrival_matrix) <- observed.unit
+  rownames(exit_matrix) <- observed.unit
+  
+  projection_arrival <- arrival_matrix[, (ncol(arrival_matrix) - projection.days):(ncol(arrival_matrix)), drop = FALSE]
+  projection_exit <- exit_matrix[, (ncol(exit_matrix) - projection.days):(ncol(exit_matrix)), drop = FALSE]
+  
+  # Step 5: Loop to go through shares
+  iteration <- 0
+  
+  for (i in shares){
+    # Step a: Split up dataset
+    training_arrival <- arrival_matrix[, (ncol(arrival_matrix) - projection.days - as.integer(i)):(ncol(arrival_matrix) - projection.days), drop = FALSE]
+    training_exit <- exit_matrix[, (ncol(exit_matrix) - projection.days - as.integer(i)):(ncol(exit_matrix) - projection.days), drop = FALSE]
+    
+    # Step b: Calculate Skellam Result
+    skellam_analysis <- f_skellam_analysis(arrival_matrix = training_arrival, 
+                                         exit_matrix = training_exit)
+    
+    skellam_matrix[, as.character(i)] <- skellam_analysis
+    
+    estimation_matrix[, as.character(i)] <- c(skellam_analysis[1] * projection.days, skellam_analysis[2] * projection.days)
+    
+    # Step c: Calculate prediction error
+    error_matrix[, as.character(i)] <- c(
+      (rowSums(projection_arrival) - skellam_analysis[1] * projection.days)^2, 
+      (rowSums(projection_exit) - skellam_analysis[2] * projection.days)^2
+    )
+    
+    iteration <- iteration + 1
+  }
+  
+  # Step 7: Return results
+  return(list("skellam_results" = skellam_matrix,
+              "estimations" = estimation_matrix,
+              "errors" = error_matrix,
+              "min_window" = rbind(
+                "min_arrivals" = colnames(error_matrix)[which(error_matrix[1, ] <= (min(error_matrix[1, ]) * (1 + error.tolerance)))[1]] %>%
+                  as.numeric(),
+                "min_exits" = colnames(error_matrix)[which(error_matrix[2, ] <= (min(error_matrix[2, ]) * (1 + error.tolerance)))[1]] %>% 
+                  as.numeric())))
+}
+f_optimal_beta <- function(observed.unit = "all_combined", beta.range = c(0, 1), beta.increments = 10, trainings.days = 140, projection.days = 7, shifting.size = 1, date.format = "%Y-%m-%d"){
+  # Step 1: Create Datasets & Storage Objects
+  # Step a: Initiate beta vector
+  beta <- runif(n = beta.increments, 
+                min = beta.range[1], 
+                max = beta.range[2]) %>% sort()
+  
+  # Step b: Initiate matrices
+  arrival_matrix <- f_generate_matrix(observed.unit = observed.unit)[, -1, drop = FALSE]
+  exit_matrix <- f_generate_matrix(observed.unit = observed.unit, type = "exits")[, -1, drop = FALSE]
+  
+  # Step c: Adapt to chosen date Format
+  adjust_day_length <- function(days, date.format) {
+    switch(date.format, 
+      "%Y-%m-%d" = days,
+      "%Y-%W"    = ceiling(days / 7),
+      "%Y-%m"    = ceiling(days / 30),
+      stop("Unsupported date format!")
+      )
+  }
+  
+  if (date.format != "%Y-%m-%d"){
+    # Step d: Reset trainings and projection days
+    trainings.days <- trainings.days/{table(arrival_matrix %>% colnames() %>% as.Date() %>% format(date.format)) %>% mean() %>% round()}
+    projection.days <- projection.days/{table(arrival_matrix %>% colnames() %>% as.Date() %>% format(date.format)) %>% mean() %>% round()}
+    
+    # Step e: Sum by selected time span
+    arrival_matrix <- arrival_matrix %>% {tapply(., colnames(.) %>% as.Date() %>% format(date.format), sum)}
+    exit_matrix <- exit_matrix %>% {tapply(., colnames(.) %>% as.Date() %>% format(date.format), sum)}
+    
+  } else {
+    exit_matrix <- exit_matrix[1, ]
+    arrival_matrix <- arrival_matrix[1, ]
+  }
+  
+  error_matrix <- matrix(0, 
+                         nrow = 2, 
+                         ncol = length(beta), 
+                         dimnames = list(c("Arrivals", "Exits"), 
+                                         beta))
+  
+  # Step 3: Define function
+  shifting_function <- function(beta, data){
+    prediction <- sapply(seq(from = 1, to = (length(data) - trainings.days - projection.days + 1), by = shifting.size),
+                         function(i){
+                           (1/trainings.days) * 
+                             sum((exp(beta * seq(0, trainings.days - 1, 1)) * 
+                                    (trainings.days/sum(exp(beta * seq(0, trainings.days - 1, 1))))) * 
+                                                      data[i:(i + trainings.days - 1)])
+                           }) * projection.days
+    
+    observations <- sapply(seq(from = (1 + trainings.days), to = (length(data) - projection.days + 1), by = shifting.size),
+                           function(i){
+                             sum(data[i:(i + projection.days - 1)])
+                             })
+    
+    errors <- sum((observations - prediction)^2)
+    
+    return(list("errors" = errors, 
+                "prediction" = prediction, 
+                "observations" = observations))
+  }
+  
+  # Step 4: Run shifting analysis
+  for (i in beta){
+    error_matrix[, as.character(i)] <- c(shifting_function(beta = i, 
+                                                           data = arrival_matrix)[["errors"]], 
+                                         shifting_function(beta = i,
+                                                           data = exit_matrix)[["errors"]])
+  }
+  
+  # Step 5: Return results
+  #return(c("Arrivals" = colnames(error_matrix)[which.min(error_matrix[1, ])] %>% as.numeric() %>% signif(3), 
+  #         "Exits" = colnames(error_matrix)[which.min(error_matrix[2, ])] %>% as.numeric() %>% signif(3)))
+  return(error_matrix)
+}
+## Retention Ratetest 
+f_retention_rate <- function(observed.unit = country_codes,
+                             time_format = "%Y-%m",
+                             date_sequence = date_all,
+                             combined = FALSE) {
+  
+  observed.unit <- as.character(observed.unit)
+  
+  if (!combined) {
+    retention_rate <- lapply(observed.unit, function(unit) {
+      if (unit %in% country_codes) {
+        f_calculate_retention(matrix_nat_arrivals[unit, ], 
+                              matrix_nat_exits[unit, ], 
+                              date_sequence, time_format)
+      } else if (as.character(unit) %in% as.character(municipalities$municipality_code)) {
+        f_calculate_retention(
+          matrix_dest_arrivals[unit, ] + matrix_int_arrivals[unit, ],
+          matrix_dest_exits[unit, ] + matrix_int_exits[unit, ],
+          date_sequence,
+          time_format
+        )
+      } else {
+        stop("Invalid observed unit.")
+      }
+    })
+    
+    # Assign names to the list based on observed.unit
+    names(retention_rate) <- observed.unit
+    
+    # Transform the list into a vector or matrix
+    if (length(retention_rate) == 1) {
+      # Single observed unit: convert to a named vector
+      result <- unlist(retention_rate, use.names = TRUE)
+    } else {
+      # Multiple observed units: convert to a matrix
+      result <- do.call(rbind, retention_rate)
+      rownames(result) <- observed.unit
+    }
+  return(result)
+    
+  } else {
+    
+    retention_rate <- list()
+    
+    for (i in observed.unit){
+      arrivals <- t(rowsum(
+        t(list_municipalities_arrivals[[i]] + list_municipalities_int_arrivals[[i]]),
+        format(date_sequence, time_format))) %>% apply(., 1, cumsum) %>% t()
+      exits <- t(rowsum(
+        t(list_municipalities_exits[[i]] + list_municipalities_int_exits[[i]]),
+        format(date_sequence, time_format))) %>% apply(., 1, cumsum) %>% t()
+      
+      retention_rate[[i]] <- (arrivals - exits)/arrivals
+      retention_rate[[i]][is.nan(retention_rate[[i]])] <- NA
+    }
+    return(retention_rate)
+  }
+}
+
+f_calculate_retention <- function(arrivals, exits, date_sequence, time_format) {
+  population <- tapply(arrivals, format(date_sequence, time_format), sum) %>% cumsum()
+  exits <- tapply(exits, format(date_sequence, time_format), sum) %>% cumsum()
+  
+  if (sum(population) > 0){
+    return((population - exits)/population)
+  } else {
+    return(rep(NA, length(population)))
+  }
+  
+}
+## Arrival v. 1st year by citizenship
+f_first_anniversary <- function(observed.unit = "all_combined"){
+  
+  # Start with full dataset
+  arrival_data <- first_main_residence %>%   
+    # Replace NA date (observations that are current) with date of the next day (today + 1)
+    mutate(update_last_date = 
+             as.Date(ifelse(is.na(update_last_date), Sys.Date() + 1, update_last_date)))
+  
+  # Apply filters conditionally
+  if (all(observed.unit %in% country_codes)) {
+    arrival_data <- arrival_data %>%
+      filter(singular_citizenship %in% observed.unit)
+  } else if (observed.unit %in% unique(first_main_residence$unhcr_region)) {
+    arrival_data <- arrival_data %>%
+      filter(unhcr_region %in% observed.unit)
+  } else if (observed.unit %in% unique(first_main_residence$age_group)) {
+    arrival_data <- arrival_data %>%
+      filter(age_group %in% observed.unit)
+  } else if (observed.unit %in% unique(first_main_residence$gender)) {
+    arrival_data <- arrival_data %>%
+      filter(gender %in% observed.unit)
+  } else if (observed.unit %in% unique(first_main_residence$asylum_status)) {
+    arrival_data <- arrival_data %>%
+      filter(asylum_status %in% observed.unit)
+  }
+  
+  # Store copy for rejoining exited individuals
+  data_filtered <- arrival_data
+  
+  # Filter only individuals with full year after arrival (which must be present in dataset, i.e. after 22.11.2022) 
+  arrival_data <- arrival_data %>%
+    arrange(person_id_ifa_hash, update_first_date) %>%
+    distinct(person_id_ifa_hash, .keep_all = TRUE) %>%
+    filter(update_first_date != "2022-11-26") %>% 
+    mutate(first_anniversary = update_first_date + 365) %>% 
+    filter(first_anniversary < Sys.Date()) %>% 
+    # Add urbanisation degrees at arrival & first anniversary
+    mutate(urbanisation_arrival =
+             municipalities$urbanisation[match(municipality_code, municipalities$municipality_code)])
+    
+  # Add first entry to the 
+  data_filtered <- data_filtered %>%
+    # Join first observation to the unfiltered dataset
+    inner_join(arrival_data %>% 
+                 select(person_id_ifa_hash, first_anniversary, municipality_code, urbanisation_arrival) %>% 
+                 rename(municipality_code_arrival = municipality_code), by = "person_id_ifa_hash") %>%
+    # Only keep observations that where current on the first anniversary
+    filter(update_first_date < first_anniversary, update_last_date > first_anniversary) %>%
+    # Add urbanisation degree at anniversary
+    mutate(urbanisation_1styear = 
+             municipalities$urbanisation[match(municipality_code, municipalities$municipality_code)])
+  
+  # Rejoin first arrivals that are absent at first anniversary (i.e., exited individuals)
+  final_data <- rbind(data_filtered,
+                      arrival_data %>% filter(person_id_ifa_hash %in% setdiff(arrival_data$person_id_ifa_hash, data_filtered$person_id_ifa_hash)),
+                      fill = TRUE)
+  
+  # Add exit as option after 1 year
+  levels(final_data$urbanisation_1styear) <- c(levels(final_data$urbanisation_1styear), "exit")
+  final_data$urbanisation_1styear[is.na(final_data$urbanisation_1styear)] <- "exit"
+  
+  # Return tabulation of rows = urbanisation at arrival and columns = urbanisation after 1 year or exit
+  return(
+    table(final_data$urbanisation_arrival, final_data$urbanisation_1styear)
+  )
+}
+## Bivariate Moran's I for Arrivals and Exits
+f_bivariate_morans_i <- function(filter = "citizenship", years = c("2023", "2024")){
+  # Step 1: Determine observed units
+  if (filter == "citizenship"){
+    filter <- first_main_residence %>%
+      arrange(person_id_ifa_hash, update_first_date) %>%
+      distinct(person_id_ifa_hash, .keep_all = TRUE) %>% 
+      {table(.$singular_citizenship)}%>% sort(decreasing = TRUE) %>% head(2) %>% names()
+  } else {
+    filter <- first_main_residence[[observed.unit]] %>% 
+      unique() %>% sort()
+  }
+  
+  # Step 2: Flow analysis by citizenship & municipality
+  skellam_analysis <- list()
+  
+  for (i in filter){
+    skellam_analysis[[i]] <- f_skellam_analysis(
+      arrival_matrix = {f_generate_matrix(observed.unit = i, 
+                                         filter = "municipality_code") +
+        f_generate_matrix(observed.unit = i, 
+                          filter = "municipality_code", 
+                          is.internal = TRUE)} %>% .[, year(colnames(.)) %in% years], 
+      exit_matrix = {f_generate_matrix(observed.unit = i,
+                                      filter = "municipality_code", 
+                                      type = "exits") +
+        f_generate_matrix(observed.unit = i, 
+                          filter = "municipality_code",
+                          type = "exits",
+                          is.internal = TRUE)} %>% .[, year(colnames(.)) %in% years]
+    )
+  }
+  
+  # Step 3: Group into regions
+  skellam_analysis <- lapply(my_list, function(matrix) {
+  matrix %>% t() %>%
+    rowsum(group = municipalities$state_urbanisation[match(colnames(matrix[[1]]), municipalities$municipality_code)]) %>% t()
+    })
+  
+  return(skellam_analysis)
+  
+  # Step 4: Calculation bivariate Moran's I
+}
+## Diaspora Model of Human Migration Flows
+f_diaspora_analysis <- function(observed.unit = "all_combined", observed.level = "municipality_code", years = c("2023", "2024"), filter.internal = FALSE, internal.rates = FALSE, r.logged = FALSE){
+  # Step 1: Calculate pull/push rates
+  if (!internal.rates){
+    pull_push_rate <- f_pull_push_rate(data = data)
+  } else {
+    pull_push_rate <- f_pull_push_rate(filter.camp = filter.camp, filter.internal = TRUE)
+  }
+  
+  # Step 2: Calculate arrival/exit rates by municipality
+  #arrivals_exits <- f_skellam_analysis(arrival_matrix = f_generate_matrix(observed_unit = observed_unit, 
+  #                                                                        filter = "municipality_code"), 
+  #                                     exit_matrix = f_generate_matrix(observed_unit = observed_unit, 
+  #                                                                     filter = "municipality_code", 
+  #                                                                     type = "exits"))
+
+  # Step 3: Calculate diaspora size by municipality
+  diaspora_matrix <- {f_generate_matrix(observed.unit = observed.unit, 
+                                        filter = observed.level,
+                                        filter.births = FALSE, 
+                                        filter.deaths = FALSE,
+                                        data = data) - 
+      f_generate_matrix(observed.unit = observed.unit, 
+                        filter = observed.level, 
+                        type = "exits",
+                        filter.births = FALSE,
+                        filter.deaths = FALSE, 
+                        data = data)} %>% 
+    apply(1, cumsum) %>% t()
+  
+  # Step 4: Estimates flows by diaspora * specific push/pull rates
+  # Step a: Calculate last day of diaspora size calculation
+  diaspora_start <- (min(as.Date(colnames(diaspora_matrix)[year(colnames(diaspora_matrix)) %in% years])) - 1) %>% as.character()
+  
+  # Step b: Calculate last day of observed time frame
+  diaspora_end <- (max(as.Date(colnames(diaspora_matrix)[year(colnames(diaspora_matrix)) %in% years])) - 1) %>% as.character()
+  
+  # Step c: Calculate number of days that are observed
+  t <- {as.Date(diaspora_end) - as.Date(diaspora_start)} %>% as.numeric()
+  
+  #stop(return(list(diaspora_matrix[, diaspora_start], push_pull_rates["pull_rates", ], push_pull_rates["push_rates", ], diaspora_matrix[, diaspora_start])))
+  inflow_estimation <- (pull_push_rate[["pull_rate"]] * diaspora_matrix[, diaspora_start]) * t
+     
+  outflow_estimation <- (pull_push_rate[["push_rate"]] * diaspora_matrix[, diaspora_start]) * t
+    
+  netflow_estimation <- inflow_estimation - outflow_estimation
+  
+  #stop(return(list(pull_push_rates["pull_rates", ], pull_push_rates["push_rates", ],diaspora_matrix[, diaspora_start], t)))
+  
+  # Step 5: Calculate real flows
+  real_inflows <- f_generate_matrix(observed.unit = observed.unit, filter = observed.level, data = data) %>% .[, year(colnames(.)) %in% years] %>% rowSums()
+  
+  real_outflows <- f_generate_matrix(observed.unit = observed.unit, type = "exits", filter = observed.level, data = data) %>% .[, year(colnames(.)) %in% years] %>% rowSums()
+  
+  real_netflows <- diaspora_matrix[, diaspora_end] - diaspora_matrix[, diaspora_start]
+  
+  # Step 6_ Calculate R-squared values
+  if (!r.logged){
+    r_squared_in <- 1 - sum((real_inflows - inflow_estimation)^2)/sum((real_inflows - mean(real_inflows))^2)
+    r_squared_out <- 1 - sum((real_outflows - outflow_estimation)^2)/sum((real_outflows - mean(real_outflows))^2)
+    r_squared_net <- 1 - sum((real_netflows - netflow_estimation)^2)/sum((real_netflows - mean(real_netflows))^2)
+  } else {
+    r_squared_in <- 1 - sum((log(real_inflows) - log(inflow_estimation))^2)/sum((log(real_inflows) - mean(log(real_inflows)))^2)
+    r_squared_out <- 1 - sum((log(real_outflows) - log(outflow_estimation))^2)/sum((log(real_outflows) - mean(log(real_outflows)))^2)
+    r_squared_net <- 1 - sum((log(real_netflows) - log(netflow_estimation))^2)/sum((log(real_netflows) - mean(log(real_netflows)))^2)
+  }
+
+  
+  # Step 6: Return result
+  #return(rbind(r_squared_in, r_squared_out, r_squared_net))
+  
+  return(list("t" = t,
+              "r_squared" = rbind("inflow" = r_squared_in, 
+                                  "outflow" = r_squared_out, 
+                                  "netflow" = r_squared_net), 
+              "diaspora_size" = diaspora_matrix[, diaspora_start],
+              "pull_rate" = pull_push_rate[["pull_rate"]],
+              "push_rate" = pull_push_rate[["push_rate"]],
+              "inflow_estimation" = inflow_estimation, 
+              "outflow_estimation" = outflow_estimation, 
+              "netflow_estimation" = netflow_estimation, 
+              "real_inflows" = real_inflows, 
+              "real_outflows" = real_outflows, 
+              "real_netflows" = real_netflows))
+}
+## Diaspora Half-Life
+f_diaspora_half_life <- function(filter = "singular_citizenship", data = filtered_data, years = c(2023, 2024)){
+  diaspora <- {{f_generate_matrix(filter = filter, data = data, filter.births = FALSE) %>% 
+      {.[, year(colnames(.)) %in% seq(from = 2022, to = years[1] - 1, by = 1)]}} - 
+      {f_generate_matrix(filter = filter, type = "exits", data = data, filter.deaths = FALSE) %>% 
+          {.[, year(colnames(.)) %in% seq(from = 2022, to = years[1] - 1, by = 1)]}}} %>% rowSums()
+  
+  exits <- f_generate_matrix(filter = filter, type = "exits", data = data) %>% 
+    {.[, year(colnames(.)) %in% years]}
+  
+  if (filter == "singular_citizenship"){
+    diaspora <- diaspora %>% sort(decreasing = TRUE) %>% head(25)
+    exits <- exits[diaspora %>% sort(decreasing = TRUE) %>% head(25) %>% names(), ]
+  }
+  
+  daily_exits <- exits %>% {apply(., MARGIN = 1, FUN = function (x) {f_poisson_fitting(vector = x)})}
+  
+  r_i <- (daily_exits * 365)/diaspora
+  
+  t_half <- log(2)/(-log(1 - r_i))
+  
+  return(data.frame(
+    diaspora_name = names(daily_exits),
+    diaspora_size = diaspora, 
+    daily_exits = daily_exits,
+    r_i = r_i, 
+    t_half = t_half
+  ))
+}
+## Flow errors
+f_flow_errors <- function(observed.unit = "all_combined", filter = "all_combined", absolute.error = TRUE, diaspora.parameter = FALSE){
+  # Observed
+  arrivals <- f_generate_matrix(observed.unit = observed.unit, filter = filter, data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  exits <- f_generate_matrix(observed.unit = observed.unit, filter = filter, data = filtered_data, type = "exits") %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  
+  # Skellam
+  skellam <- f_skellam_analysis(arrival_matrix = arrivals,
+                                exit_matrix = exits)
+  
+  # Diaspora
+  if (diaspora.parameter){
+    diaspora <- {{f_generate_matrix(filter = filter, data = filtered_data, filter.births = FALSE) %>% 
+      {.[, year(colnames(.)) %in% seq(from = 2022, to = as.integer(years[1]) - 1, by = 1)]}} - 
+    {f_generate_matrix(filter = filter, type = "exits", filter.deaths = FALSE, data = filtered_data) %>%
+        {.[, year(colnames(.)) %in% seq(from = 2022, to = as.integer(years[1]) - 1, by = 1)]}}} %>% rowSums()
+    
+    pull_push_rates <- f_pull_push_rate(data = filtered_data)
+    
+    skellam <- rbind(
+      diaspora * pull_push_rates[2], 
+      diaspora * pull_push_rates[3]
+    )
+  }
+  
+  if (filter == "singular_citizenship"){
+    arrivals <- arrivals[top_25_diaspora, ]
+    exits <- exits[top_25_diaspora, ] 
+    skellam <- skellam[, top_25_diaspora]
+  }
+  
+  # Mean Error
+  if (absolute.error){
+    mean_error_arrivals <- (1/ncol(arrivals)) * rowSums(abs(arrivals - skellam[1, ]))
+    mean_error_exits <- (1/ncol(exits)) * rowSums(abs(exits - skellam[2, ]))
+  } else {
+    mean_error_arrivals <- (100/ncol(arrivals)) * rowSums(abs((arrivals - skellam[1, ])))/(rowSums(arrivals))
+    mean_error_exits <- (100/ncol(exits)) * rowSums(abs((exits - skellam[2, ])))/(rowSums(exits))
+  }
+  
+  return(
+    data.frame(
+      mean_error_arrivals = mean_error_arrivals, 
+      mean_error_exits = mean_error_exits
+    )
+  )
+}
+```
+### Plots
+```{r Plot Theme, include = FALSE}
+theme_science_advances_main <- theme_classic(base_size = 8, base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(size = 18, face = "bold"),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 18),
+    legend.title = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    legend.position = "none",     
+    axis.text.x = element_text(angle = 0, hjust = 0.5, margin = margin(t = 5)),
+    axis.text.y = element_text(margin = margin(r = 5)),
+    axis.line = element_line(linewidth = 0.8, color = "black"),
+    axis.ticks = element_line(linewidth = 0.8, color = "black"),
+    axis.ticks.length = unit(6, "pt")
+  )
+
+theme_science_advances <- theme_classic(base_size = 8, base_family = "Helvetica") +
+  theme(
+    plot.title = element_text(size = 8, face = "bold"),
+    axis.title = element_text(size = 8),
+    axis.text = element_text(size = 8),
+    legend.title = element_text(size = 8),
+    legend.text = element_text(size = 8),
+    legend.position = "none",     
+    axis.text.x = element_text(angle = 0, hjust = 0.5)
+    )
+```
+```{r Appendix Plots, include = FALSE}
+### Flow intensities
+f_plotappendix_flow <- function(observed.unit = "all_combined", years = c(2023, 2024), alpha = 0.01, data = filtered_data, if.big = FALSE) {
+  # Generate matrices
+  arrivals <- f_generate_matrix(observed.unit = observed.unit, data = data) %>% {
+    .[, year(colnames(.)) %in% years]
+  }
+  
+  exits <- f_generate_matrix(observed.unit = observed.unit, data = data, type = "exits") %>% {
+    .[, year(colnames(.)) %in% years]
+  }
+
+  # Extract date vector from column names
+  dates <- as.Date(names(arrivals))
+  
+  # Run Skellam analysis
+  skellam <- f_skellam_analysis(arrival_matrix = arrivals, exit_matrix = exits)
+  
+  # Create data for plotting (using actual dates as x-axis)
+  plot_data <- tibble(
+    date = dates,
+    arrivals = cumsum(arrivals),
+    exits = cumsum(exits)
+  ) %>% mutate(
+    modelled_arrivals = row_number() * skellam[1, ],
+    modelled_exits = row_number() * skellam[2, ],
+    lower_ci_arrivals = modelled_arrivals - qnorm(1 - alpha/2) * sqrt(modelled_arrivals),
+    upper_ci_arrivals = modelled_arrivals + qnorm(1 - alpha/2) * sqrt(modelled_arrivals),
+    lower_ci_exits = modelled_exits - qnorm(1 - alpha/2) * sqrt(modelled_exits),
+    upper_ci_exits = modelled_exits + qnorm(1 - alpha/2) * sqrt(modelled_exits)
+  )
+  
+  # Dynamic title logic
+  title_label <- ""
+  if (observed.unit != "all_combined") {
+    if (!is.na(suppressWarnings(as.numeric(observed.unit)))) {
+      title_label <- paste("Age", observed.unit)
+    } else if (observed.unit %in% unique(data$age_category)) {
+    title_label <- observed.unit 
+    } else {
+      country_name <- countrycode(observed.unit, origin = "iso2c", destination = "country.name", , custom_match = c("XK" = "Kosovo"))
+      title_label <- ifelse(is.na(country_name), observed.unit, country_name)
+    }
+  }
+  
+  if (!if.big){
+    linewidth <- 0.5
+  } else {
+    linewidth <- 1.5
+  }
+  
+  # Plot
+  if (!if.big){
+  plot <- ggplot(plot_data) +
+    # Confidence ribbons
+    geom_ribbon(aes(x = date, ymin = lower_ci_arrivals, ymax = upper_ci_arrivals),
+                fill = "#4279b0", alpha = 0.2) +
+    geom_ribbon(aes(x = date, ymin = lower_ci_exits, ymax = upper_ci_exits),
+                fill = "#9e3547", alpha = 0.2) +
+    
+    # Observed cumulative arrivals/exits
+    geom_line(aes(x = date, y = arrivals, color = "Observed Arrivals"), linewidth = linewidth) +
+    geom_line(aes(x = date, y = exits, color = "Observed Exits"), linewidth = linewidth) +
+    
+    # Modelled arrivals/exits
+    geom_line(aes(x = date, y = modelled_arrivals, color = "Modelled Arrivals"),
+              linewidth = linewidth, linetype = "dashed") +
+    geom_line(aes(x = date, y = modelled_exits, color = "Modelled Exits"),
+              linewidth = linewidth, linetype = "dashed") +
+    
+    # Custom color mapping
+    scale_color_manual(values = c(
+      "Observed Arrivals" = "#4279b0",
+      "Modelled Arrivals" = "#4279b0",
+      "Observed Exits" = "#9e3547",
+      "Modelled Exits" = "#9e3547"
+    )) +
+    
+    # Format x-axis as every 3 months with year below
+    scale_x_date(
+      breaks = function(x) {
+        # Round down to the 1st of the month for min date
+        start_date <- as.Date(format(min(x), "%Y-%m-01"))
+        
+        # Round up to the 1st of the next month after max(x)
+        end_date <- as.Date(format(max(x) + 31, "%Y-%m-01"))
+        
+        # Generate all 3-month breaks between start and end
+        all_breaks <- seq(from = start_date, to = end_date, by = "3 months")
+        
+        # Keep only those within the range of your data
+        all_breaks[all_breaks >= min(dates) & all_breaks <= max(dates)]
+      },
+      date_labels = "%b\n%Y"
+    ) +
+    scale_y_continuous(labels = function(x) x / 1000) +
+    
+    # Labels and formatting
+    labs(
+      x = "",
+      y = "",
+      color = "",
+      title = title_label
+    ) +
+    theme_science_advances
+  } else {
+    plot <- ggplot(plot_data) +
+      # Observed cumulative arrivals/exits
+      geom_line(aes(x = date, y = arrivals, color = "Observed Arrivals"), linewidth = linewidth) +
+      geom_line(aes(x = date, y = exits, color = "Observed Exits"), linewidth = linewidth) +
+      
+      # Modelled arrivals/exits
+      geom_line(aes(x = date, y = modelled_arrivals, color = "Modelled Arrivals", alpha = 0.5),
+                linewidth = linewidth, linetype = "dashed") +
+      geom_line(aes(x = date, y = modelled_exits, color = "Modelled Exits", alpha = 0.5),
+                linewidth = linewidth, linetype = "dashed") +
+      
+      # Labels and formatting
+      labs(
+        x = "",
+        y = "",
+        color = "",
+        title = title_label
+      ) +
+      
+      # Custom color mapping
+      scale_color_manual(values = c(
+        "Observed Arrivals" = "#4279b0",
+        "Modelled Arrivals" = "#4279b0",
+        "Observed Exits" = "#9e3547",
+        "Modelled Exits" = "#9e3547"
+      )) +
+      scale_x_date(
+        breaks = function(x) {
+          start_date <- as.Date(format(min(x), "%Y-%m-01"))
+          end_date <- as.Date(format(max(x) + 31, "%Y-%m-01"))
+          all_breaks <- seq(from = start_date, to = end_date, by = "3 months")
+          all_breaks[all_breaks >= min(dates) & all_breaks <= max(dates)]
+        },
+        date_labels = "%b\n%Y",
+        expand = c(0, 0)
+      ) +
+      scale_y_continuous(
+        labels = function(x) x / 1000,
+        expand = c(0, 0)
+      ) + theme_science_advances_main
+  }
+  
+  return(plot)
+}
+### Age Urbanisation State Heatmap
+f_plotappendix_heatmap <- function(years = c(2023, 2024), data = filtered_data,  is.logarithmic = FALSE, cluster.dimension = 4, projection.days = 1, breaks = "individual"){
+  # --- Function to generate heatmap df for one group
+  generate_bivariate_df <- function(group_name) {
+    arrival_matrix <- f_generate_matrix(
+      observed.unit = group_name,
+      filter = "state_urbanisation",
+      filter.deaths = TRUE,
+      filter.births = TRUE, 
+      data = data
+    ) %>% {.[, year(colnames(.)) %in% years]}
+    
+    exit_matrix <- f_generate_matrix(
+      observed.unit = group_name,
+      filter = "state_urbanisation",
+      type = "exits",
+      filter.deaths = TRUE,
+      filter.births = TRUE,
+      data = data
+    ) %>% {.[, year(colnames(.)) %in% years]}
+    
+    skellam_analysis <- f_skellam_analysis(arrival_matrix, exit_matrix)
+    
+    df <- data.frame(
+      state = sub("-.*", "", colnames(skellam_analysis)), 
+      urbanisation = sub(".*-", "", colnames(skellam_analysis)), 
+      arrivals = skellam_analysis[1, ], 
+      exits = skellam_analysis[2, ]
+    )
+    
+    class_brks <- classIntervals(skellam_analysis[which.max(apply(skellam_analysis[c(1, 2), ], 1, max)), ] * projection.days,
+                           n = cluster.dimension, style = "kmeans")[["brks"]] %>% 
+      {c(0, .[-1])}
+    
+    df <- df %>%
+      mutate(
+        label = paste(ifelse(arrivals < 1, format(round(arrivals, 1), nsmall = 1), as.character(round(arrivals))),
+                      ifelse(exits < 1, format(round(exits, 1), nsmall = 1), as.character(round(exits))), 
+                      sep = " / "),
+        bi_class = paste(
+          cut(exits * projection.days,    class_brks, labels = FALSE, include.lowest = TRUE, right = FALSE),
+          cut(arrivals * projection.days, class_brks, labels = FALSE, include.lowest = TRUE, right = FALSE),
+          sep = "-"
+        ),
+        urbanisation = factor(urbanisation, levels = c("rural", "intermediate", "urban")),
+        age_group = group_name
+      )
+    #}
+    
+    return(df)
+  }
+  
+  # --- Generate list of data frames
+  df_list <- map(c("Children", "Young Adults", "Middle-Aged Adults", "Older Adults", "Seniors"), generate_bivariate_df)
+  
+  # --- Function to generate a tight heatmap
+  plot_one_agegroup <- function(df) {
+    ggplot(df, aes(x = urbanisation, y = state, fill = bi_class)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = label, color = "white"), size = 4.2) +
+      bi_scale_fill(pal = "DkViolet2", dim = 4) +
+      coord_fixed() +
+      theme_minimal(base_size = 10) +
+      ggtitle(unique(df$age_group)) +
+      theme(
+        axis.text = element_blank(),    
+        axis.ticks = element_blank(),       
+        axis.title = element_blank(),       
+        panel.grid.major = element_line(color = "grey90", linewidth = 0.3),
+        panel.grid.minor = element_blank(),  
+        plot.title = element_blank(),
+        legend.position = "none",
+        plot.margin = unit(c(0, 0, 0, 0), "pt") 
+      ) +
+      scale_color_identity()
+  }
+  
+  # Generate all plots (no axis labels anymore)
+  plots <- map(df_list, plot_one_agegroup)
+  
+  # Build final layout
+  final_plot <- ggdraw()
+  for (i in seq_along(plots)) {
+    final_plot <- final_plot +
+      draw_plot(plots[[i]],
+                x = (i - 1) * 1 / length(plots),
+                y = 0,
+                width = 1 / length(plots),
+                height = 1)
+  }
+  
+  return(final_plot)
+}
+### Bivariate grouped map
+f_plotappendix_map <- function(group_name = "all_combined", years = c("2023", "2024"), data = filtered_data, cluster.dimension = 4, projection.days = 1){
+    arrival_matrix <- f_generate_matrix(
+      observed.unit = group_name,
+      filter = "state_urbanisation",
+      filter.deaths = TRUE,
+      filter.births = TRUE, 
+      data = data
+    ) %>% {.[, year(colnames(.)) %in% years]}
+    
+    exit_matrix <- f_generate_matrix(
+      observed.unit = group_name,
+      filter = "state_urbanisation",
+      type = "exits",
+      filter.deaths = TRUE,
+      filter.births = TRUE,
+      data = data
+    ) %>% {.[, year(colnames(.)) %in% years]}
+    
+    skellam_analysis <- f_skellam_analysis(arrival_matrix, exit_matrix)
+    
+    class_brks <- classIntervals(skellam_analysis[which.max(apply(skellam_analysis[c(1, 2), ], 1, max)), ] * projection.days,
+                                 n = cluster.dimension, style = "kmeans")[["brks"]] %>%
+      {c(0, .[-1])}
+    
+    df <- data.frame(
+      state_urbanisation = colnames(skellam_analysis),
+      arrivals = skellam_analysis[1, ], 
+      exits = skellam_analysis[2, ]
+      ) %>%
+      mutate(
+        label = paste(ifelse(arrivals < 1, format(round(arrivals, 1), nsmall = 1), as.character(round(arrivals))),
+                      ifelse(exits < 1, format(round(exits, 1), nsmall = 1), as.character(round(exits))), 
+                      sep = " / "),
+        bi_class = paste(
+          cut(exits * projection.days,    class_brks, labels = FALSE, include.lowest = TRUE, right = FALSE),
+          cut(arrivals * projection.days, class_brks, labels = FALSE, include.lowest = TRUE, right = FALSE),
+          sep = "-"
+        )
+      )
+  
+  map_data <- austria_simplified %>%
+    left_join(municipalities %>%
+                select(municipality_code, state_urbanisation) %>%
+                mutate(g_id = as.character(municipality_code)), 
+              by = c("g_id")) %>% 
+      group_by(state_urbanisation) %>% summarise(geometry = st_union(geometry), .groups = "drop") %>% 
+    left_join(df, 
+              by = "state_urbanisation")
+  
+  plot <- ggplot() +
+    geom_sf(map_data, mapping = aes(fill = bi_class), color = "white", linewidth = 0.1, show.legend = FALSE) +
+    bi_scale_fill(pal = "DkViolet2", dim = cluster.dimension, flip_axes = FALSE) +
+    bi_theme()
+    
+  plot <- plot + theme(
+    plot.margin = margin(0, 0, 0, 0, unit = "pt")
+    )
+    
+  final_plot <- ggdraw() +
+    draw_plot(plot, 0, 0, 1, 1)
+  
+  return(final_plot)
+}
+### Skellam Plot Citizenships 
+f_plotappendix_citizen <- function(years = c(2023, 2024), data = filtered_data){
+    arrival_matrix <- f_generate_matrix(
+      filter = "singular_citizenship",
+      filter.deaths = TRUE,
+      filter.births = TRUE, 
+      data = data
+    ) %>% {.[top_25_diaspora , year(colnames(.)) %in% years]}
+    
+    exit_matrix <- f_generate_matrix(
+      filter = "singular_citizenship",
+      type = "exits",
+      filter.deaths = TRUE,
+      filter.births = TRUE,
+      data = data
+    ) %>% {.[top_25_diaspora, year(colnames(.)) %in% years]}
+    
+    skellam_analysis <- f_skellam_analysis(arrival_matrix, exit_matrix)
+    
+    plot_data <- data.frame(
+      arrivals = skellam_analysis[1, ], 
+      exits = skellam_analysis[2, ]
+    ) %>%
+      mutate(region = ifelse(exits > arrivals, "above", "below"))
+    
+    plot <- ggplot(plot_data, aes(x = arrivals, y = exits, size = 2.5)) +
+      # Red fill ABOVE the identity line (y > x)
+      annotate(geom = "polygon", 
+               x = c(-Inf, Inf, -Inf), 
+               y = c(-Inf, Inf, Inf),
+               fill = "#9e3547", alpha = 0.25) +
+      
+      # Blue fill BELOW the identity line (y < x)
+      annotate("polygon",
+               x = c(-Inf, Inf, Inf), 
+               y = c(-Inf, Inf, -Inf),
+               fill = "#4279b0", alpha = 0.25) +
+      
+      # Identity line
+      geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "black", linewidth = 1.25, alpha = 0.5) +
+    
+      # Points
+      geom_point(aes(color = region), alpha = 0.75) +
+      scale_color_manual(values = c("above" = "#9e3547", "below" = "#4279b0")) +
+      
+      # Axis + theme
+      labs(x = "", y = "", color = "") +
+      coord_cartesian(xlim = c(0, 50), ylim = c(0, 50)) +
+      scale_x_continuous(expand = expansion(mult = c(0, 0.02))) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.02))) +
+      theme_minimal() +
+      theme_science_advances_main
+   
+    return(plot)
+}
+### Half-Life Plots
+f_plotappendix_half_life <- function(half_life_analysis) {
+  data <- half_life_analysis
+  
+  time_range <- seq(0, max(data$t_half) + 5, by = 0.1)
+  
+  decay_data <- data %>%
+    rowwise() %>%
+    do({
+      tibble(
+        diaspora_name = .$diaspora_name,
+        t = time_range,
+        percent_remaining = 100 * exp(-.$r_i * time_range),
+        t_half = .$t_half
+      )
+    }) %>%
+    ungroup()
+  
+  plot <- ggplot(decay_data, aes(x = t, y = percent_remaining, color = diaspora_name)) +
+    geom_line(linewidth = 1.2) +
+
+    # Horizontal dashed line at 50%
+    geom_hline(yintercept = 50, linetype = "dashed", color = "black", linewidth = 1, alpha = 0.5) +
+    
+    scale_y_continuous(name = "Population Remaining (%)", limits = c(0, 105), expand = expansion(mult = c(0, 0.05))) +
+    scale_x_continuous(name = "Time (in years)", expand = expansion(mult = c(0, 0.05))) +
+    
+    # Nice qualitative color palette
+    ggsci::scale_color_d3(name = "") +
+    
+    theme_minimal(base_size = 13) +
+    theme_science_advances_main +
+    theme(
+      legend.position = "bottom",
+      legend.box = "horizontal",
+      legend.text = element_text(size = 13),
+      plot.title = element_text(face = "bold"),
+      plot.subtitle = element_text(size = 11)
+    )
+  
+  return(plot)
+}
+## Assortativity Testing
+f_plotappendix_assortativity <- function(selected_group, type = c("arrivals", "exits")) {
+  type <- match.arg(type)
+  
+  # Base dataframe
+  df_testing <- data.frame(
+    name = municipalities$municipality_name[match(
+      municipalities$municipality_code, 
+      unique(first_main_residence[["municipality_code"]], na.rm = TRUE) %>% sort(na.last = FALSE))],
+    code = municipalities$municipality_code[match(
+      municipalities$municipality_code, 
+      unique(first_main_residence[["municipality_code"]], na.rm = TRUE) %>% sort(na.last = FALSE))],
+    population = municipalities$population_2023[match(
+      municipalities$municipality_code, 
+      unique(first_main_residence[["municipality_code"]], na.rm = TRUE) %>% sort(na.last = FALSE))],
+    diaspora_size = {
+      f_generate_matrix(observed.unit = selected_group, filter = "municipality_code", data = filtered_data, filter.births = FALSE) %>% {.[, year(colnames(.)) %in% c("2022")]} -
+      f_generate_matrix(observed.unit = selected_group, filter = "municipality_code", type = "exits", data = filtered_data, filter.deaths = FALSE) %>% {.[, year(colnames(.)) %in% c("2022")]}
+    } %>% rowSums()
+  )
+  
+  # Calculate proportions
+  df_testing <- df_testing %>% 
+    mutate(
+      assort_diaspora = replace(diaspora_size, is.na(diaspora_size) | diaspora_size < 0, 0) / sum(replace(diaspora_size, is.na(diaspora_size) | diaspora_size < 0, 0)),
+      assort_population = population / sum(population, na.rm = TRUE),
+      obs_arrivals = f_generate_matrix(observed.unit = selected_group, filter = "municipality_code", data = filtered_data) %>% 
+        {.[, year(colnames(.)) %in% c("2023", "2024")]} %>% 
+        rowSums(),
+      obs_exits = f_generate_matrix(observed.unit = selected_group, filter = "municipality_code", type = "exits", data = filtered_data) %>% 
+        {.[, year(colnames(.)) %in% c("2023", "2024")]} %>%
+        rowSums()
+    )
+  
+  # Choose data depending on type
+  y_var <- if (type == "arrivals") "obs_arrivals" else "obs_exits"
+  label <- if (type == "arrivals") "Arrivals" else "Exits"
+  colour <- if (type == "arrivals") "#4279b0" else "#9e3547"
+  
+  total_obs <- sum(df_testing[[y_var]], na.rm = TRUE)
+  
+  # Simulate multinomial draws
+  boot_diaspora <- rmultinom(n = 100, size = total_obs, prob = df_testing$assort_diaspora)
+  boot_population <- rmultinom(n = 100, size = total_obs, prob = df_testing$assort_population)
+  
+  # Prepare plotting data
+  test <- cbind(df_testing, boot_diaspora, boot_population)
+  colnames(test) <- make.unique(colnames(test))
+  
+  plot_data <- test %>%
+    mutate(rank = rank(-.data[[y_var]], ties.method = "first")) %>%
+    filter(.data[[y_var]] > 0)
+  
+  # Build plot
+  plot <- ggplot(plot_data, aes(x = rank, y = .data[[y_var]])) +
+    scale_x_continuous(name = "Rank", trans = "log10") +
+    scale_y_continuous(name = label, trans = "log10")
+  
+  # Add diaspora simulations
+  for (i in 1:100) {
+    plot <- plot +
+      geom_point(aes(x = rank, y = .data[[as.character(i)]]), color = colour, alpha = 0.025, size = 3)
+  }
+  
+  # Add population simulations
+  for (i in 1:100) {
+    plot <- plot +
+      geom_point(aes(x = rank, y = .data[[paste(i, ".1", sep = "")]]), color = "grey", alpha = 0.025, size = 3)
+  }
+  
+  # Add actual data
+  plot <- plot +
+    geom_point(shape = 4, size = 2, stroke = 1) + 
+    theme_science_advances_main
+  
+  return(plot)
+}
+## Flow Intensities Age
+f_plotappendix_flow_age <- function(urbanisation = "all_combined"){
+  arrivals_age <- f_generate_matrix(observed.unit = urbanisation, filter = "age", data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  exits_age <- f_generate_matrix(observed.unit = urbanisation, filter = "age", type = "exits", data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  
+  skellam_age <- f_skellam_analysis(arrival_matrix = arrivals_age,
+                                    exit_matrix = exits_age)
+  
+  age_cohorts <- c("Children", "Young Adults", "Middle-Aged Adults", "Older Adults", "Seniors")
+  
+  df <- data.frame(
+    age = colnames(skellam_age) %>% as.integer(), 
+    arrival_rates = skellam_age[1, ], 
+    exit_rates = -skellam_age[2, ],
+    net_migration = skellam_age[3, ]
+  ) %>% mutate(
+    age_group = cut(age, c(0, 17, 34, 54, 69, 101), 
+                                labels = age_cohorts, right = FALSE), .after = "net_migration") %>% 
+    filter(age > 2, age < 101)
+  
+  df$age_group <- as.character(df$age_group)
+  
+  for (j in setdiff(age_cohorts, "Seniors")) {
+    
+    next_group <- age_cohorts[match(j, age_cohorts) + 1]
+    
+    # Get first row from next group
+    row <- df %>%
+      filter(age_group == next_group) %>%
+      slice(1)
+    
+    # Replace age_group with current one
+    row$age_group <- j
+    
+    # Append to df
+    df <- bind_rows(df, row)
+  }
+  
+  # Color map
+  group_colors <- c(
+    "Children" = "#782766",
+    "Young Adults" = "#d2b350",
+    "Middle-Aged Adults" = "#4c7fb4",
+    "Older Adults" = "#1b9caf",
+    "Seniors" = "#58d769"
+  )
+  
+  # Ribbon Layer Function
+  ribbon_layer <- function(group_name, color) {
+    #if (group_name == "Seniors"){
+      geom_ribbon(
+        data = df %>% filter(age_group == group_name),
+        aes(
+          x = age,
+          ymin = ifelse(net_migration < 0, net_migration, 0),
+          ymax = ifelse(net_migration > 0, net_migration, 0)
+        ),
+        fill = color,
+        alpha = 0.6
+      )      
+    #} else {
+    #  geom_ribbon(
+    #    data = df %>% filter(age_group == group_name),
+    #    aes(
+    #      x = c(age, max(age) + 1),
+    #      ymin = ifelse(net_migration < 0, c(net_migration, df %>% filter(age_group == age_cohorts[match(group_name, age_cohorts) + 1]) %>% slice(1) %>% pull(net_migration)), 0),
+    #      ymax = ifelse(net_migration > 0, c(net_migration, df %>% filter(age_group == age_cohorts[match(group_name, age_cohorts) + 1]) %>% slice(1) %>% pull(net_migration)), 0)
+    #    ),
+    #    fill = color,
+    #    alpha = 0.6
+    #  )
+    #}
+  }
+  
+  limit <- 100
+  y_breaks <- c(-5, 0, 5, 10, 15)
+  y_labels <- c("5", "0", "5", "10", "15")
+  
+  if (urbanisation != "all_combined"){
+    limit <- 66
+    y_breaks <- c(-5, 0, 5, 10)
+    y_labels <- c("5", "0", "5", "10")
+    df <- df %>% filter(age < 66)
+  }
+  
+  # PLot
+  plot <- ggplot(df, aes(x = age)) +
+    
+    geom_hline(yintercept = 0, linetype = "dashed", color = "grey50", linewidth = 1) + 
+    geom_vline(xintercept = seq(5, limit, by = 10), color = "grey90", linewidth = 0.4) + 
+    
+    # Add ribbons per group
+    ribbon_layer("Children", group_colors["Children"]) +
+    ribbon_layer("Young Adults", group_colors["Young Adults"]) +
+    ribbon_layer("Middle-Aged Adults", group_colors["Middle-Aged Adults"]) +
+    ribbon_layer("Older Adults", group_colors["Older Adults"]) +
+    ribbon_layer("Seniors", group_colors["Seniors"]) +
+  
+    # Arrival / Exit lines
+    geom_line(aes(y = net_migration), linetype = "solid", linewidth = 1, color = "black") +
+    #annotate("text", x = 60, y = max(df$arrival_rates), label = "Daily Net Migration", color = "#3E80B6", hjust = 0) +
+    
+    geom_line(aes(y = arrival_rates), linetype = "dashed", linewidth = 1, color = "#3E80B6") +
+    #annotate("text", x = 60, y = max(df$arrival_rates), label = "Daily Arrivals", color = "#3E80B6", hjust = 0) +
+  
+    geom_line(aes(y = exit_rates), linetype = "dashed", linewidth = 1, color = "#A94442") +
+    #annotate("text", x = 60, y = min(df$exit_rates), label = "Daily Exits", color = "#A94442", hjust = 0) +
+  
+    # Axis and theme
+    labs(x = "Age", y = NULL)
+  
+  if (urbanisation == "all_combined"){
+    plot <- plot + scale_y_continuous(breaks = c(-5, 0, 5, 10, 15),
+                                      labels = c("5", "0", "5", "10", "15")) +
+    scale_x_continuous(breaks = seq(5, 100, by = 10), 
+                       limits = c(2, 100),
+                       expand = c(0, 0)) +
+      theme_science_advances_main
+  } else {
+    plot <- plot + scale_y_continuous(breaks = c(-5, 0, 5, 10),
+                                      labels = c("5", "0", "5", "10"), 
+                                      limits = c(-5, 10)) +
+      scale_x_continuous(breaks = seq(5, 66, by = 10),
+                         limits = c(2, 66),
+                         expand = c(0, 0)) +
+      theme_science_advances_main
+      
+  }
+  
+  return(plot)
+  
+}
+## Flow Stability
+f_plotappendix_flow_stability_error <- function(filter = "singular_citizenship"){
+  error_flows <- function(matrix.observed, matrix.modelled){
+    days <- ifelse(is.numeric(ncol(matrix.observed)), ncol(matrix.observed), length(matrix.observed))
+    
+    if (is.numeric(nrow(matrix.observed))){
+      return(
+        rowSums(sqrt(
+          (matrix.observed - matrix.modelled)^2
+          ))/(days * rowSums(matrix.observed))
+      )
+    } else {
+        return(
+          rowSums(sqrt(
+            (matrix.observed - matrix.modelled)^2
+            ))/(days * sum(matrix.observed))
+        )
+      }
+    }
+  
+  # Construct arrival & exit matrices
+  arrivals <- f_generate_matrix(filter = filter, filter.births = TRUE, data = filtered_data) %>% {.[, year(colnames(.)) %in% c("2023", "2024")]}
+  
+  exits <- f_generate_matrix(filter = filter, type = "exits", filter.deaths = TRUE, data = filtered_data) %>% {.[, year(colnames(.)) %in% c("2023", "2024")]}
+  
+  # Skellam parameters
+  skellam_analysis <- f_skellam_analysis(arrival_matrix = arrivals, exit_matrix = exits)
+  
+  if (filter == "singular_citizenship"){
+    skellam_analysis <- skellam_analysis[, top_25_diaspora]
+    
+    arrivals <- arrivals[top_25_diaspora, ]
+    exits <- exits[top_25_diaspora, ]
+  }
+  
+  # Modeled Arrivals
+  t <- matrix(rep(1:ncol(arrivals), each = nrow(arrivals)), 
+              nrow = nrow(arrivals), 
+              byrow = FALSE, 
+              dimnames = list(rownames(arrivals), colnames(arrivals)))
+    
+  modelled_arrivals <- sweep(t, 1, skellam_analysis[1, ], "*")
+  modelled_exits <- sweep(t, 1, skellam_analysis[2, ], "*")
+  
+  df <- data.frame(
+    names = rownames(arrivals),
+    error_arrivals = error_flows(matrix.observed = arrivals,
+                                 matrix.modelled = modelled_arrivals),
+    error_exits = error_flows(matrix.observed = exits,
+                              matrix.modelled = modelled_exits)
+  )
+  
+  lim <- range(c(df$error_arrivals, df$error_exits), na.rm = TRUE)
+  
+  plot <- df %>% ggplot(mapping = aes(x = error_arrivals, y = error_exits)) +
+    geom_abline(
+      slope     = 1, intercept = 0,
+      linetype  = "dashed",
+      colour    = "grey50",
+      linewidth = 1.5
+      ) +
+    geom_point(size = 2.5, colour = "#F54927", alpha = 0.5) +
+    geom_text_repel(aes(label = names, colour = "#F54927"),
+                    size = 7,
+                    max.overlaps = Inf,
+                    box.padding = 0.4,
+                    point.padding = 0.3,
+                    segment.color = "#F54927",
+                    min.segment.length = 0) +
+    theme_minimal(base_size = 14) +
+    scale_x_continuous(limits = lim) +
+    scale_y_continuous(limits = lim) +
+    labs(title = "",
+         x = "Error Arrivals", y = "Error Exits") +
+    theme_science_advances_main
+  
+  return(plot)
+}
+## Flow Stability
+f_plotappendix_flow_stability <- function(observed.unit, if.country = TRUE){
+  arrivals <- f_generate_matrix(observed.unit = observed.unit, data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  exits <- f_generate_matrix(observed.unit = observed.unit, data = filtered_data, type = "exits") %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  
+  if (if.country){
+    title <- countrycode(observed.unit, "iso2c", "country.name", custom_match = c("XK" = "Kosovo", "STATELESS" = "Stateless"))
+  } else {
+    title <- observed.unit
+  }
+  
+  plot_stability <- tibble(
+    day_frac = seq_len(731) / 731, 
+    arrivals = cumsum(arrivals) / sum(arrivals),
+    exits    = cumsum(exits) / sum(exits)
+  ) |>
+    pivot_longer(c(arrivals, exits),
+                 names_to  = "flow",
+                 values_to = "cum_prop") %>% 
+    ggplot(aes(day_frac, cum_prop, colour = flow)) +
+    geom_line(linewidth = 2) +
+    geom_abline(intercept = 0, slope = 1,
+                linetype = "dashed", linewidth = 1,
+                colour = "grey") +
+    scale_colour_manual(values = c(arrivals = "#4278b0", exits = "#9e3547"),
+                        labels = c(arrivals = "Arrivals", exits = "Exits")) +
+    labs(title    =  title,
+         x        = "Fraction of Time",
+         y        = "Cumulative Proportion",
+         colour   = NULL) +
+    coord_equal(expand = FALSE) +
+    theme_science_advances_main
+  
+  return(plot_stability)
+}
+## Diaspora Model Observed v Modelled
+f_plotappendix_diaspora_model_observed <- function(filter = "singular_citizenship", diaspora.parameter = FALSE, type = "arrivals", is.daily = FALSE){
+  # Observed
+  arrivals <- f_generate_matrix(filter = filter, data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  exits <- f_generate_matrix(filter = filter, data = filtered_data, type = "exits") %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  
+  if (diaspora.parameter){
+    diaspora <- {{f_generate_matrix(filter = filter, data = filtered_data, filter.births = FALSE) %>%
+          {.[, year(colnames(.)) %in% seq(from = 2022, to = as.integer(years[1]) - 1, by = 1)]}} -
+          {f_generate_matrix(filter = filter, type = "exits", filter.deaths = FALSE, data = filtered_data) %>%
+              {.[, year(colnames(.)) %in% seq(from = 2022, to = as.integer(years[1]) - 1, by = 1)]}}} %>% rowSums()
+    
+    pull_push_rates <- f_pull_push_rate(data = filtered_data)
+    
+
+    skellam <- rbind(
+      diaspora * pull_push_rates[2], 
+      diaspora * pull_push_rates[3])
+    if (!is.daily){
+      skellam <- skellam * 731
+    }
+  } else {
+    skellam <- f_skellam_analysis(arrival_matrix = arrivals,
+                                  exit_matrix = exits)
+      if (!is.daily){
+        skellam <- skellam * 731
+      }
+  }
+  
+  if (filter == "singular_citizenship"){
+    arrivals <- arrivals[top_25_diaspora, ]
+    exits <- exits[top_25_diaspora, ] 
+    skellam <- skellam[, top_25_diaspora]
+  }
+  
+  colour <- "#4278b0"
+  
+  if (type == "exits"){
+    arrivals <- exits
+    skellam[1, ] <- skellam[2, ]
+    colour <- "#9e3547"
+  }
+  
+  if (is.daily){
+    skellam <- rep(skellam[1, ], each = ncol(arrivals))
+    arrivals <- as.vector(t(arrivals))
+  } else {
+    arrivals <- arrivals %>% rowSums()
+    skellam <- skellam[1, ]
+  }
+  
+  df <- data.frame(
+    observed = arrivals, 
+    modelled = skellam
+  )
+  
+  if(is.daily){
+    df <- df %>% filter(arrivals != 0)
+    alpha <- 0.1
+  } else {
+    df <- df %>% mutate(names = rownames(arrivals))
+    alpha <- 0.5
+  }
+  
+  plot <- df %>% ggplot(mapping = aes(x = observed, y = modelled)) +
+    geom_abline(
+      slope     = 1, intercept = 0,
+      linetype  = "dashed",
+      colour    = "grey50",
+      linewidth = 1.5
+      ) +
+    geom_point(size = 2.5, colour = colour, alpha = alpha)
+  
+  if(!is.daily){
+    plot <- plot + geom_text_repel(aes(label = names, colour = colour),
+                                   size = 7,
+                                   max.overlaps = Inf,
+                                   box.padding = 0.4,
+                                   point.padding = 0.3,
+                                   segment.color = colour,
+                                   min.segment.length = 0)
+  }
+  
+  plot <- plot + theme_minimal(base_size = 14) +
+    labs(title = "",
+         x = "Observed", y = "Modelled") +
+    theme_science_advances_main
+  
+  return(plot)
+}
+f_plotappendix_diaspora_model_observed_2 <- function(filter = "singular_citizenship", 
+                                                   diaspora.parameter = FALSE, 
+                                                   is.daily = FALSE,
+                                                   is.weekly = TRUE) {
+  # Get observed matrices
+  arrivals <- f_generate_matrix(filter = filter, data = filtered_data) %>% 
+    {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  exits <- f_generate_matrix(filter = filter, data = filtered_data, type = "exits") %>% 
+    {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  
+  if (diaspora.parameter) {
+    diaspora <- {{f_generate_matrix(filter = filter, data = filtered_data, filter.births = FALSE) %>%
+        {.[, year(colnames(.)) %in% seq(2022, as.integer(years[1]) - 1, 1)]}} -
+    {f_generate_matrix(filter = filter, type = "exits", filter.deaths = FALSE, data = filtered_data) %>%
+        {.[, year(colnames(.)) %in% seq(2022, as.integer(years[1]) - 1, 1)]}}} %>% rowSums()
+    
+    pull_push_rates <- f_pull_push_rate(data = filtered_data)
+    
+    skellam_arrivals <- diaspora * pull_push_rates[2]
+    skellam_exits <- diaspora * pull_push_rates[3]
+    
+    if (!is.daily) {
+      skellam_arrivals <- skellam_arrivals * 731
+      skellam_exits <- skellam_exits * 731
+    }
+    
+  } else {
+    skellam <- f_skellam_analysis(arrival_matrix = arrivals, exit_matrix = exits)
+    
+    skellam_arrivals <- skellam[1, ]
+    skellam_exits    <- skellam[2, ]
+    
+    if (!is.daily) {
+      skellam_arrivals <- skellam_arrivals * 731
+      skellam_exits    <- skellam_exits * 731
+    }
+  }
+  
+  if (is.weekly){
+    arrivals <- rowsum(arrivals %>% t(), format(colnames(arrivals) %>% as.Date(), "%Y-%U")) %>% t()
+    exits <- rowsum(exits %>% t(), format(colnames(exits) %>% as.Date(), "%Y-%U")) %>% t()
+    
+    skellam_arrivals <- skellam_arrivals * 7
+    skellam_exits <- skellam_exits * 7
+  }
+  
+  if (filter == "singular_citizenship") {
+    arrivals <- arrivals[top_25_diaspora, ]
+    exits    <- exits[top_25_diaspora, ]
+    skellam_arrivals <- skellam_arrivals[top_25_diaspora]
+    skellam_exits    <- skellam_exits[top_25_diaspora]
+  }
+  
+  if (is.daily) {
+    # Flatten matrices
+    arrivals_vec <- as.vector(t(arrivals))
+    exits_vec    <- as.vector(t(exits))
+    
+    skellam_arrivals <- rep(skellam_arrivals, each = ncol(arrivals))
+    skellam_exits    <- rep(skellam_exits, each = ncol(exits))
+    
+    # Build combined data
+    df <- data.frame(
+      observed = c(arrivals_vec, exits_vec),
+      modelled = c(skellam_arrivals, skellam_exits),
+      type = rep(c("Arrivals", "Exits"), each = length(arrivals_vec))
+    ) %>% 
+      filter(observed != 0)
+    
+    alpha <- 0.1
+    
+  } else {
+    # Sum across years
+    arrivals_sum <- rowSums(arrivals)
+    exits_sum    <- rowSums(exits)
+    
+    df <- data.frame(
+      observed = c(arrivals_sum, exits_sum),
+      modelled = c(skellam_arrivals, skellam_exits),
+      type = rep(c("Arrivals", "Exits"), each = length(arrivals_sum)),
+      names = rep(rownames(arrivals), 2)
+    )
+    
+    alpha <- 0.5
+  }
+  
+  # Colors
+  plot_colors <- c("Arrivals" = "#4278b0", "Exits" = "#9e3547")
+  
+  # Build plot
+  plot <- ggplot(df, aes(x = observed, y = modelled, color = type)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey50", linewidth = 1.5) +
+    geom_point(size = 2.5, alpha = alpha) +
+    scale_color_manual(values = plot_colors)
+  
+  if (!is.daily) {
+    plot <- plot + 
+      geom_text_repel(aes(label = names),
+                      size = 7,
+                      max.overlaps = Inf,
+                      box.padding = 0.4,
+                      point.padding = 0.3,
+                      segment.color = "grey50",
+                      min.segment.length = 0)
+  }
+  
+  plot <- plot + 
+    theme_minimal(base_size = 14) +
+    labs(title = "", x = "Observed", y = "Modelled", color = "") +
+    theme_science_advances_main
+  
+  return(plot)
+}
+```
+### Maps
+```{r Maps, include = FALSE}
+## Map of Austria
+f_map <- function(data = f_skellam_analysis(f_generate_matrix(filter = "municipality_code") %>% .[, year(colnames(.)) %in% c("2023", "2024")], 
+                                            f_generate_matrix(filter = "municipality_code", type = "exits") %>% .[, year(colnames(.)) %in% c("2023", "2024")]),
+                  plotly = TRUE){
+  data <- data.frame(municipality = colnames(data), 
+                     value = data[1, ] - data[2, ], 
+                     text = paste(municipalities$municipality_name[match(as.integer(colnames(data)), municipalities$municipality_code)], "<br>",
+                                  "Arrivals: ", round(data[1,]), "<br>",
+                                  "Exits: ", round(data[2,])))
+  data$value[is.na(data$value)] <- 0
+  
+  map_data <- austria_simplified %>%
+    #filter(austria_simplified$g_id %in% data$municipality) %>%
+    left_join(
+      data,
+      by = c("g_id" = "municipality"), 
+      keep = TRUE
+    )
+  
+  map_data$municipality[is.na(map_data$municipality)] <- map_data$g_id[is.na(map_data$municipality)]
+  map_data$value[is.na(map_data$value)] <- 0
+  map_data$text[is.na(map_data$text)] <- paste(map_data$g_name, "<br>",
+                                  "Arrivals: ", 0, "<br>",
+                                  "Exits: ", 0)
+  
+  plot <- map_data %>% ggplot() +
+    geom_sf(mapping = aes(fill = value, text = text), linewidth = 0.02) +
+    scale_fill_gradient2(low = "darkorange",
+                         mid = "white",
+                         high = "slateblue", 
+                         midpoint = 0,
+                         trans = "log1p", 
+                         na.value = "white"
+                         )  +
+    theme_void()
+  
+  if(plotly){
+    return(ggplotly(plot, tooltip = "text") %>% style(hoveron = "fill"))
+  } else {
+    return(plot)
+  }
+}
+## Map Diaspora
+f_map_diaspora <- function(filter_citizenship = "all_combined"){
+  diaspora <- {{f_generate_matrix(observed.unit = filter_citizenship,
+                                 filter = "municipality_code") %>% {.[, year(colnames(.)) %in% c("2022")]}} - 
+    {f_generate_matrix(observed.unit = filter_citizenship,
+                       filter = "municipality_code", 
+                       type = "exits") %>% {.[, year(colnames(.)) %in% c("2022")]}}} %>% rowSums()
+  diaspora <- data.frame(
+    code = names(diaspora), 
+    diaspora = diaspora
+    )
+  
+  map <- austria_simplified %>% 
+    left_join(y = diaspora, by = c("g_id" = "code")) %>% 
+    ggplot() + 
+    geom_sf(mapping = aes(fill = diaspora), linewidth = 0.02) +
+    scale_fill_gradient2(low = "white",
+                         high = "darkorange", 
+                         midpoint = 0,
+                         trans = "log1p", 
+                         na.value = "white"
+                         )  +
+    theme_void()
+  
+  return(map)
+    
+}
+## Map filtered
+f_map_filtered <- function(filter_citizenship,
+                           time_sequence = 1:length(date_all[-1]),
+                           prediction_period = 30) {
+  f_map(
+    f_skellam_analysis(
+      as.character(municipalities$municipality_code),
+      f_table_to_full_matrix(
+        inter_area_movement %>%
+          filter(singular_citizenship == filter_citizenship) %>%
+          {table(.$municipality_code, .$update_first_date)},
+        "municipality"
+      )[, -1],
+      f_table_to_full_matrix(
+        inter_area_movement %>%
+          filter(singular_citizenship == filter_citizenship) %>%
+          #arrange(person_id_ifa_hash) %>%
+          #distinct(.keep_all = TRUE) %>%
+          #filter(is_current == FALSE) %>%
+          {table(.$municipality_code, .$update_last_date)},
+        "municipality"
+      )[, -1],
+      time_sequence
+    ) * prediction_period,
+    plotly = FALSE
+  ) + ggtitle(paste("Net migration", "by citizens of", countrycode(filter_citizenship, "iso2c", "country.name")), 
+              subtitle = "for the next 30 days including inner-Austrian movements")
+}
+
+## Map clustered
+f_map_clustered <- function(citizenship,
+                            centers = 5,
+                            kmeans = TRUE, 
+                            matrix = list_municipality_skellam_ext){
+  if (kmeans) {
+    cluster_result <- kmeans(t(matrix[[citizenship]]), centers = centers)
+  } else {
+    cluster_result <- cutree(hclust(dist(t(matrix[["DE"]][1:2, ])), method = "average"), k = centers)
+  }
+  
+  
+  data <- data.frame(
+    municipality = names(cluster_result$cluster),
+    cluster = cluster_result$cluster
+  )
+  
+  map_data <- austria_simplified %>%
+    #filter(austria_simplified$g_id %in% data$municipality) %>%
+    left_join(
+      data,
+      by = c("g_id" = "municipality"), 
+      keep = TRUE
+    )
+  
+   plot <- map_data %>% ggplot() +
+    geom_sf(mapping = aes(fill = cluster), linewidth = 0.01) +
+    theme_void() + 
+     ggtitle(paste("k-means cluster of net-migration by citizens of", countrycode(citizenship, "iso2c", "country.name")))
+   
+   return(plot)
+}
+
+## Bivariate Choropleth Map
+f_map_bivariate_choropleth <- function(observed.unit = "all_combined",
+                                       years = c("2023", "2024"),
+                                       skellam_analysis_type = "unweighted",
+                                       type = "external",
+                                       logarithmic = FALSE, 
+                                       is.vienna = FALSE, 
+                                       projection.days = 92, 
+                                       show.legend = TRUE,
+                                       grouped = "urbanisation",
+                                       cluster.dimension = 4,
+                                       custom.breaks = FALSE, 
+                                       data = filtered_data){
+  
+  #Step 1: Skellam Analysis
+  if (skellam_analysis_type == "weighted"){
+    if (type == "external"){
+      skellam_analysis <- f_skellam_weighted(arrival_matrix = f_generate_matrix(observed.unit = observed.unit,
+                                                                                filter = "municipality_code", 
+                                                                                filter.births = TRUE, 
+                                                                                filter.deaths = TRUE, 
+                                                                                data = data) %>% .[, year(colnames(.)) %in% years],
+                                             exit_matrix = f_generate_matrix(observed.unit = observed.unit,
+                                                                             filter = "municipality_code", 
+                                                                             type = "exits",
+                                                                             filter.births = TRUE,
+                                                                             filter.deaths = TRUE, 
+                                                                             data = data) %>% .[, year(colnames(.)) %in% years])
+    } else if (type == "internal"){
+          skellam_analysis <- f_skellam_weighted(arrival_matrix = f_generate_matrix(observed.unit = observed.unit, 
+                                                                              filter = "municipality_code", 
+                                                                              is.internal = TRUE) %>% .[, year(colnames(.)) %in% years], 
+                                           exit_matrix = f_generate_matrix(observed.unit = observed.unit,
+                                                                           filter = "municipality_code", type = "exits", 
+                                                                           is.internal = TRUE) %>% .[, year(colnames(.)) %in% years])
+    }
+
+  } else if (skellam_analysis_type == "unweighted"){
+    if (type == "external"){
+      skellam_analysis <- f_skellam_analysis(arrival_matrix = f_generate_matrix(observed.unit = observed.unit,
+                                                                                filter = "municipality_code", 
+                                                                                data = data) %>% .[, year(colnames(.)) %in% years],
+                                             exit_matrix = f_generate_matrix(observed.unit = observed.unit,
+                                                                             filter = "municipality_code", 
+                                                                             type = "exits",
+                                                                             data = data) %>% .[, year(colnames(.)) %in% years])
+    } else if (type == "internal"){
+      skellam_analysis <- f_skellam_analysis(arrival_matrix = f_generate_matrix(observed.unit = observed.unit,
+                                                                                filter = "municipality_code", 
+                                                                                is.internal = TRUE) %>% .[, year(colnames(.)) %in% years],
+                                             exit_matrix = f_generate_matrix(observed.unit = observed.unit,
+                                                                             filter = "municipality_code", type = "exits", 
+                                                                             is.internal = TRUE) %>% .[, year(colnames(.)) %in% years])
+    }
+  } else if (skellam_analysis_type == "diaspora"){
+    rates <- f_pull_push_rate()
+    
+    pull_rate <- rates$pull_rate
+    
+    push_rate <- rates$push_rate
+    
+    diaspora_size <- {{f_generate_matrix(observed.unit = observed.unit, 
+                                        filter = "municipality_code") %>% .[, year(colnames(.)) %in% c("2022")]} -
+      {f_generate_matrix(observed.unit = observed.unit, 
+                                        filter = "municipality_code", 
+                         type = "exits") %>% .[, year(colnames(.)) %in% c("2022")]}} %>% rowSums()
+    
+    
+    skellam_analysis <- rbind(
+      "lambda" = diaspora_size * pull_rate * projection.days, 
+      "gamma" = diaspora_size * push_rate * projection.days
+    )
+    
+    skellam_analysis <- rbind(
+      skellam_analysis, 
+      "net_migration" = skellam_analysis[1, ] - skellam_analysis[2, ]
+    )
+  }
+  
+  # Step 2: Group results if grouped == TRUE
+  if (grouped == "urbanisation"){
+    skellam_analysis <- skellam_analysis[, intersect(colnames(skellam_analysis), municipalities$municipality_code)] %>%
+      cbind(matrix(0,
+                   nrow = 3,
+                   ncol = length(setdiff(municipalities$municipality_code, colnames(.))),
+                   dimnames = list(rownames(.), setdiff(municipalities$municipality_code, colnames(.))))) %>% t() %>% 
+      {rowsum(x = ., group = municipalities$state_urbanisation[match(rownames(.), municipalities$municipality_code)])} %>% t()
+  } else if (grouped == "nuts3"){
+    skellam_analysis <- skellam_analysis[, intersect(colnames(skellam_analysis), municipalities$municipality_code[!is.na(municipalities$NUTS3)])] %>%
+      cbind(matrix(0,
+                   nrow = 3,
+                   ncol = length(setdiff(municipalities$municipality_code, colnames(.))),
+                   dimnames = list(rownames(.), setdiff(municipalities$municipality_code, colnames(.))))) %>% t() %>% 
+      {rowsum(x = ., group = municipalities$NUTS3[match(rownames(.), municipalities$municipality_code)])} %>% t()
+  }
+  
+  # Step 3: create clustering for in- and outflows
+  if (logarithmic){
+    class_brks <- classIntervals(skellam_analysis[which.max(apply(skellam_analysis[c(1, 2), ], 1, max)), ] %>% {log(. * 365 + 1)},
+                                 n = 4, style = "fisher")[["brks"]]
+    class_brks[1] <- -Inf
+    class_brks[length(class_brks)] <- Inf
+    
+    first_cluster <- cut(skellam_analysis[1, ] %>% {log(. * 365 + 1)},
+                         class_brks, 
+                           labels = FALSE, include.lowest = TRUE, right = FALSE)
+    
+    second_cluster <- cut(skellam_analysis[2, ] %>% {log(. * 365 + 1)},
+                         class_brks, 
+                           labels = FALSE, include.lowest = TRUE, right = FALSE)  
+  } else {
+    class_brks <- classIntervals(skellam_analysis[which.max(apply(skellam_analysis[c(1, 2), ], 1, max)), ],
+                             n = cluster.dimension, style = "kmeans")[["brks"]] %>% 
+      {c(0, .[-1])}
+    
+    first_cluster <-  cut(skellam_analysis[2, ],    class_brks, labels = FALSE, include.lowest = TRUE, right = FALSE)
+    
+    second_cluster <-  cut(skellam_analysis[1, ],    class_brks, labels = FALSE, include.lowest = TRUE, right = FALSE)
+  }
+  
+  if (custom.breaks){
+    class_brks <- custom_breaks
+    
+    first_cluster <- cut(skellam_analysis[1, ] * projection.days,
+                         class_brks, 
+                           labels = FALSE, include.lowest = TRUE, right = FALSE)
+    
+    second_cluster <- cut(skellam_analysis[2, ] * projection.days,
+                         class_brks, 
+                           labels = FALSE, include.lowest = TRUE, right = FALSE) 
+  }
+  
+  skellam_analysis <- skellam_analysis %>% t() %>% as.data.frame() %>% 
+    mutate("state_urbanisation" = colnames(skellam_analysis), 
+           "bi_class" = paste(first_cluster, second_cluster, sep = "-"))
+  
+  # Step 5: Create Map Data
+  if (grouped == ""){
+    # Create map data
+    map_data <- left_join(austria_simplified,
+                        data.frame(
+                          g_id = rownames(skellam_analysis),
+                          bi_class = paste(first_cluster,
+                                           "-",
+                                           second_cluster,
+                                           sep = ""
+                                           )
+                          ),
+                        by = c("g_id")
+                        )
+    
+    # Filter viennese municipalities
+    if (is.vienna){
+      map_data <- filter(map_data, as.integer(g_id) > 90000)
+    }
+    
+  } else if (grouped == "urbanisation"){
+    # Step a: create map data
+    map_data <- austria_simplified %>%
+      left_join(municipalities %>%
+                  select(municipality_code, state_urbanisation) %>%
+                  mutate(g_id = as.character(municipality_code)), 
+                by = c("g_id")) %>% 
+        group_by(state_urbanisation) %>% summarise(geometry = st_union(geometry), .groups = "drop") %>% 
+      left_join(skellam_analysis, 
+                by = "state_urbanisation")
+      
+    # Filter viennese municipalities
+    if (is.vienna){
+      map_data <- filter(map_data, as.integer(g_id) > 90000)
+    }
+  } else if (grouped == "nuts3"){
+    # Step a: create map data
+    map_data <- austria_simplified %>%
+      left_join(municipalities %>%
+                  select(municipality_code, NUTS3) %>%
+                  mutate(g_id = as.character(municipality_code)), 
+                by = c("g_id")) %>% 
+        group_by(NUTS3) %>% summarise(geometry = st_union(geometry), .groups = "drop") %>% 
+      left_join(skellam_analysis, 
+                by = "NUTS3")
+      
+    # Filter viennese municipalities
+    if (is.vienna){
+      map_data <- filter(map_data, as.integer(g_id) > 90000)
+    }
+  }
+  
+  # Step 6: Create Plot
+  plot <- ggplot() +
+    geom_sf(map_data, mapping = aes(fill = bi_class), color = "white", linewidth = 0.1, show.legend = FALSE) +
+    bi_scale_fill(pal = "DkViolet2", dim = cluster.dimension, flip_axes = TRUE) +
+    bi_theme()
+  
+  #final_plot <- ggdraw() +
+  #  draw_plot(plot, 0, 0, 1, 1)
+  
+  if (show.legend){
+    # Create legend
+    legend <- bi_legend(pal = "DkViolet2", 
+                      dim = cluster.dimension, 
+                      xlab = "Arrivals",
+                      ylab = "Exits", 
+                      size = 8, 
+                      flip_axes = TRUE)
+    
+    final_plot <- ggdraw() + 
+      draw_plot(plot, 0, 0, 1, 1) + 
+      draw_plot(legend, 0.2, .65, 0.2, 0.2)
+    
+  } else {
+    plot <- plot + theme(
+      plot.margin = margin(0, 0, 0, 0, unit = "pt")
+      )
+    
+    final_plot <- ggdraw() + 
+      draw_plot(plot, 0, 0, 1, 1)
+  }
+    
+  return(final_plot)
+}
+```
+## Dataset
+### Connection
+```{r Connection to Datawarehouse, include = FALSE}
+if (!require("config")) install.packages("config")
+library("config")
+
+dw <- config::get("datawarehouse")
+
+con <- DBI::dbConnect(RPostgreSQL::PostgreSQL(),    
+                      host = dw$host,   
+                      port = dw$port,   
+                      dbname = dw$dbname,   
+                      user = dw$user,   
+                      password = dw$password,
+                      options = dw$options)
+ 
+rm(dw)
+```
+### Datasets
+#### Loading Dataset
+```{sql Loading of person_ranges, connection = con, output.var = "person_ranges"}
+SELECT LOWER(date_range)::DATE AS update_first_date, UPPER(date_range)::DATE AS update_last_date, * 
+FROM person_ranges
+```
+```{sql Loading of first_main_residence, connection = con, output.var = "first_main_residence"}
+SELECT LOWER(date_range)::DATE AS update_first_date, UPPER(date_range)::DATE AS update_last_date, * 
+FROM first_main_residence
+```
+```{sql Loading of person_status_ranges, connection = con, output.var = "person_status_ranges"}
+SELECT LOWER(date_range)::DATE AS update_first_date, UPPER(date_range)::DATE AS update_last_date, * 
+FROM person_status_ranges
+```
+#### Helper Elements
+```{r Helper Elements, include = FALSE}
+## Date Vector
+date_all <- seq(as.Date(min(person_ranges$update_first_date)), as.Date(max(person_ranges$update_last_date, na.rm = TRUE)), by = 1)
+
+## Time Vector
+time_all <- seq(0, length(date_all) - 1, by = 1)
+
+## Country Codes
+country_codes <- sort(unique(person_ranges$singular_citizenship[person_ranges$singular_citizenship != ""]), decreasing = FALSE)
+
+## Austrian States
+austrian_states <- setNames(c("Burgenland", "Kärnten", "Niederösterreich", "Oberösterreich", "Salzburg", "Steiermark", "Tirol", "Vorarlberg", "Wien"),
+                            seq(1, 9, by = 1))
+
+## Municipality names
+municipalities <- read.csv("gemliste_knz.csv") %>%
+  left_join(read.csv("austria_municipalities_classification.csv") %>% select(municipality_code, urbanisation),
+            by = c("municipality_code")) %>%
+  mutate(urbanisation = factor(urbanisation, levels = c(1, 2, 3), labels = c("urban", "intermediate", "rural"))) %>% 
+  left_join(read.csv("austria_municipalities_typology.csv") %>% select(municipality_code, typology), 
+            by = c("municipality_code")) %>% 
+  mutate(state = austrian_states[substr(municipality_code %>% as.integer(), 1, 1)] %>% as.factor()) %>%
+  mutate(state_urbanisation = interaction(state, urbanisation, sep = "-")) %>% 
+  mutate(city_suburbs_rural = factor(ifelse(grepl("rural", state_urbanisation), "rural", as.character(state_urbanisation)))) %>% 
+  filter(population_2023 > 0 & municipality_code %in% unique(first_main_residence$municipality_code))
+
+## WB Classificatons & NUTS3-Regions Austria
+wb_classification <- read.csv("municipality_planning/modified_country_classification.csv", header = TRUE)
+municipalities <- left_join(municipalities, read.csv("municipality_planning/postal_municipality_nuts3.csv", header = TRUE)[, 2:3] %>%
+                              filter(!duplicated(municipality_code)), by = "municipality_code")
+```
+#### Preparation Dataset
+```{r Loading & Preparation of Dataset, include = FALSE}
+# Main Dataset person_ranges
+{
+  # Convert to data.table at the start and do all in data.table syntax
+  setDT(person_ranges)
+  
+  # Add age
+  person_ranges[, age := fifelse(
+    year_of_death == -1,
+    year(update_first_date) - year_of_birth,
+    year_of_death - year_of_birth
+  )]
+  
+  # Fix empty strings in citizenship
+  person_ranges[, citizenship_country_id_s := fifelse(
+    citizenship_country_id_s == "", NA, citizenship_country_id_s
+  )]
+  
+  # Extract/clean singular citizenship
+  person_ranges[, singular_citizenship := substr(citizenship_country_id_s, 1, 2)]
+  person_ranges[grepl("STATELESS", citizenship_country_id_s), singular_citizenship := "STATELESS"]
+  person_ranges[singular_citizenship == "UK", singular_citizenship := "GB"]
+  person_ranges[singular_citizenship == "KO", singular_citizenship := "XK"]
+  person_ranges[singular_citizenship == "UN", singular_citizenship := "XK"]
+  
+  # Transfer citizenship to all entries of one person if present in at least one row
+  person_ranges[, singular_citizenship := singular_citizenship[!is.na(singular_citizenship)][1],
+                by = person_id_ifa_hash]
+  
+  # Add UNHCR region
+  person_ranges[, unhcr_region := countrycode(
+    singular_citizenship, "iso2c", "unhcr.region",
+    custom_match = c("STATELESS" = "Rest of the World", "TW" = "Asia and the Pacific", "UNK" = "Europe", "XK" = "Europe")
+  )]
+  
+  # Add World Bank income group
+  person_ranges[, wb_income_group := wb_classification$Income.Group[
+    match(singular_citizenship, wb_classification$Citizenship.Country.ID.S)
+  ]]
+
+# Optionally add age group:
+# person_ranges[, age_group := cut(
+#   age, seq(0, 101, by = 10),
+#   labels = paste0(seq(0, 90, by = 10), "-", seq(10, 100, by = 10)),
+#   right = FALSE
+# )]
+}
+
+# Person Status Ranges
+{
+  # Set data frame to data table
+  person_status_ranges <- setDT(person_status_ranges)
+}
+
+# First Main Residence
+{
+  # Add citizenship and age to first_main_residence dataset
+  first_main_residence <- first_main_residence %>% 
+    # Make it a data.table
+    setDT() %>% 
+    # Join with person_ranges
+    left_join(person_ranges %>% 
+                select(person_id_ifa_hash, names(person_ranges)[!names(person_ranges) %in% names(first_main_residence)]) %>%
+                distinct(person_id_ifa_hash, .keep_all = TRUE), by = "person_id_ifa_hash") %>%
+    mutate(age = fifelse(year_of_death == -1,
+                         year(update_first_date) - year_of_birth,
+                         year_of_death - year_of_birth), 
+           age_group = cut(age, seq(0, 101, by = 10), 
+                           labels = paste(seq(0, 90, by = 10), "-", c(seq(9, 89, by = 10), 100), sep = ""), right = FALSE),
+           age_category = cut(age, c(0, 17, 34, 54, 69, 101), 
+                              labels = c("Children", "Young Adults", "Middle-Aged Adults", "Older Adults", "Seniors"), right = FALSE), .after = "age") %>%
+    # Add NUS3 region
+    #.[, NUTS3 := municipalities$NUTS3[match(municipality_code, municipalities$municipality_code)]] %>%
+    # Add urbanisation
+    .[, urbanisation := municipalities$urbanisation[match(.$municipality_code, municipalities$municipality_code)]] %>% 
+    .[, state_urbanisation := municipalities$state_urbanisation[match(.$municipality_code, municipalities$municipality_code)]] %>% 
+    # Add asylum status
+    .[, asylum_status := "empty"] %>% 
+    .[person_status_ranges %>%
+        mutate(update_last_date = as.Date(fifelse(is.na(update_last_date), Sys.Date() + 1, update_last_date))), 
+               on = .(person_id_ifa_hash, update_first_date >= update_first_date, update_first_date <= update_last_date), 
+               asylum_status := i.asylum_status] %>% 
+    # Filter non-existent Municipality codes
+    filter(municipality_code %in% municipalities$municipality_code)
+    # Add asylum status
+    #first_main_residence <- first_main_residence[, asylum_status := "empty"]
+  
+    #first_main_residence <- first_main_residence[person_status_ranges %>% 
+    #                                               mutate(update_last_date = as.Date(fifelse(is.na(update_last_date), Sys.Date() + 1, update_last_date))), 
+    #             on = .(person_id_ifa_hash, update_first_date >= update_first_date, update_first_date <= update_last_date), 
+    #             asylum_status := i.asylum_status]
+
+}
+```
+#### Internal Movements
+```{r Intra-Austria Movements, include = FALSE, eval = FALSE}
+# Inter-municipality movement w/o inner-district (option to exclude inner Vienna moves)
+inter_area_movement <- as.data.table(first_main_residence) %>%
+  .[order(person_id_ifa_hash, -update_first_date)] %>%  # Sort like arrange(desc(update_first_date))
+  .[, old_municipality := shift(municipality_code %>% as.numeric(), type = "lead"), by = person_id_ifa_hash] %>%  # Lead equivalent
+  .[is.na(old_municipality), old_municipality := 0] %>%  # Replace NA with 0
+  .[order(person_id_ifa_hash, update_first_date)] %>%  # Sort back
+  .[, .SD[-1], by = person_id_ifa_hash] %>%  # Remove first row per group (slice(-1))
+  .[municipality_code != old_municipality & old_municipality != 0] #%>%  # Exclude same-municipality movements
+  #.[as.integer(municipality_code) + as.integer(old_municipality) >= 180000]  # Exclude Vienna
+```
+#### Check for Observation Gaps
+```{r Check for Observation Gaps, include = FALSE, eval = FALSE}
+# Check for data entry gaps
+{
+  observation_gaps_residence <- first_main_residence %>%
+    setDT() %>%
+    .[order(person_id_ifa_hash, -update_first_date)] %>%  # Sort efficiently
+    .[, prev_end_date := shift(update_last_date, type = "lead"), by = person_id_ifa_hash] %>%
+    .[, observation_gap := update_first_date - prev_end_date]
+  
+  observation_gaps_person <- person_ranges %>% 
+    .[order(person_id_ifa_hash, -update_first_date)] %>% 
+    .[, prev_end_date := shift(update_last_date, type = "lead"), by = person_id_ifa_hash] %>% 
+    .[, observation_gap := update_first_date - prev_end_date]
+  
+  observation_gaps_status <- person_status_ranges %>% 
+    .[order(person_id_ifa_hash, -update_first_date)] %>% 
+    .[, prev_end_date := shift(update_last_date, type = "lead"), by = person_id_ifa_hash] %>% 
+    .[, observation_gap := update_first_date - prev_end_date]
+}
+```
+#### Shape Austria
+```{r Shape Austria, include = FALSE}
+unzip("OGDEXT_GEM_1_STATISTIK_AUSTRIA_20240101.zip", junkpaths = FALSE)
+
+# Austria shape - File
+austria_shape <- read_sf("STATISTIK_AUSTRIA_GEM_20240101.shp")
+
+# Simplyfication of Austria Shape
+austria_simplified <- austria_shape
+austria_simplified$geometry <- st_cast(ms_simplify(st_geometry(austria_simplified$geometry, 
+                                                               col = "white", 
+                                                               bg = "white", 
+                                                               #linewidth = 0.01, 
+                                                               border = 0.1), 
+                                                   keep = 0.01,
+                          keep_shapes = TRUE),
+                          "MULTIPOLYGON",
+                          warn = FALSE)
+
+austria_simplified$geometry <- st_make_valid(austria_simplified$geometry)
+
+rm(austria_shape)
+
+## Distance Matrix for Austrian Municipalities
+# austria_distances <- st_centroid(austria_simplified) %>% st_distance() %>% as.numeric() %>% matrix(., nrow = length(municipalities$municipality_code))
+# dimnames(austria_distances) <- list(municipalities$municipality_code, municipalities$municipality_code)
+
+## Neighbour Object Queens Neighbour
+# neighbouring_municipalities <- poly2nb(as(austria_simplified, "Spatial"), queen = TRUE) %>% nb2listw()
+
+## Already resident in Austria before 26.11.2022
+# already_resident <- first_main_residence %>% filter(update_first_date == "2022-11-26") %>% distinct(person_id_ifa_hash) %>% pull(person_id_ifa_hash)
+```
+## Appendix Paper
+```{r Data description, include = FALSE, eval = FALSE}
+ids_included <- first_main_residence %>% 
+  filter(if_all(-all_of("update_last_date"), ~ !is.na(.))) %>% 
+  arrange(person_id_ifa_hash, update_first_date) %>%
+  distinct(person_id_ifa_hash, .keep_all = TRUE) %>% 
+  filter(year(update_first_date) %in% c("2022", "2023", "2024")) %>% 
+  filter(singular_citizenship != "STATELESS" & age != 0 & age != 1)
+
+filtered_data <- first_main_residence %>% 
+  filter(person_id_ifa_hash %in% ids_included$person_id_ifa_hash) %>% 
+  #filter(year(update_first_date) %in% c("2022", "2023", "2024")) %>% 
+  filter(if_all(-c(update_last_date, asylum_status), ~ !is.na(.)))
+
+diaspora <- {{f_generate_matrix(filter = "singular_citizenship", data = filtered_data, filter.births = FALSE) %>% {.[, year(colnames(.)) %in% c("2022")]}} - {f_generate_matrix(filter = "singular_citizenship", type = "exits", data = filtered_data, filter.deaths = TRUE) %>% {.[, year(colnames(.)) %in% c("2022")]}}} %>% rowSums()
+
+top_25_diaspora <- diaspora %>% sort() %>% tail(25) %>% names()
+```
+```{r Flow intensities, include = FALSE, eval = FALSE}
+# By Citizenship
+arrivals_citizen <- f_generate_matrix(filter = "singular_citizenship", data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+exits_citizen <- f_generate_matrix(filter = "singular_citizenship", type = "exits", data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+
+skellam_citizen <- f_skellam_analysis(arrival_matrix = arrivals_citizen, 
+                                      exit_matrix = exits_citizen)
+
+# By Age
+arrivals_age <- f_generate_matrix(filter = "age", data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+exits_age <- f_generate_matrix(filter = "age", type = "exits", data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+
+skellam_citizen <- f_skellam_analysis(arrival_matrix = arrivals_citizen, 
+                                      exit_matrix = exits_citizen)
+
+```
+```{r Diaspora Halflife, include = FALSE, eval = FALSE}
+half_life_citizen <- f_diaspora_half_life()
+ggsave(
+  filename = "P1_plots/3_Half_Life/citizen.png",
+  plot = f_plotappendix_half_life(half_life_citizen %>% filter(diaspora_name %in% c("UA", "IN", "CN", "DE", "TR", "AF", "PL", "SY", "RU", "BG"))),
+  width = 20,         
+  height = 15,        
+  units = "cm",
+  dpi = 600,
+  limitsize = FALSE
+)
+
+half_life_age <- f_diaspora_half_life("age_category")
+ggsave(
+  filename = "P1_plots/3_Half_Life/age.png",
+  plot = f_plotappendix_half_life(half_life_age),
+  width = 20,         
+  height = 15,   
+  units = "cm",
+  dpi = 600,
+  limitsize = FALSE
+)
+
+half_life_state_urbanisation <- f_diaspora_half_life("state_urbanisation")
+
+half_life_urbanisation <- f_diaspora_half_life("urbanisation")
+ggsave(
+  filename = "P1_plots/3_Half_Life/urbanisation.png",
+  plot = f_plotappendix_half_life(half_life_urbanisation),
+  width = 20,         
+  height = 15,   
+  units = "cm",
+  dpi = 600,
+  limitsize = FALSE
+)
+```
+```{r Plots Flow, include = FALSE, eval = FALSE}
+# Cumulative Flows Plot
+ggsave(
+  filename = paste("P1_plots/", "cumulative_flows", ".pdf", sep = ""),
+  plot = f_plotappendix_flow(if.big = TRUE), 
+  width = 16, 
+  height = 12, 
+  units = "cm", 
+  device = "pdf")
+
+# Flow Intensities by citizenship
+ggsave(
+  filename = paste("P1_plots/", "flow_intensities_citizenship", ".pdf", sep = ""),
+  plot = f_plotappendix_citizen(), 
+  width = 16, 
+  height = 12, 
+  units = "cm", 
+  device = "pdf")
+
+# Flow intensities by Age
+ggsave(
+  filename = paste("P1_plots/", "flow_intensities_age", ".pdf", sep = ""),
+  plot = f_plotappendix_flow_age(), 
+  width = 29.37, 
+  height = 18.15, 
+  units = "cm", 
+  device = "pdf")
+
+# Flow intensities by Age and Urbanisation
+for (i in c("urban", "intermediate", "rural")){
+  ggsave(
+    filename = paste("P1_plots/flow_intensities_age_", i,  ".pdf", sep = ""),
+    plot = f_plotappendix_flow_age(i), 
+    width = 18, 
+    height = 14, 
+    units = "cm", 
+    device = "pdf")
+}
+
+# Cumulative flows
+## Citizenship
+for (i in top_25_diaspora){
+  ## 2023
+  #ggsave(paste("P1_plots/1_Flows/flow_citizenship/2023/", i, ".png", sep = ""), 
+  #       f_plotappendix_flow(observed.unit = i, years = 2023, alpha = 0.01), width = 3.4, height = 2.5, units = "in", dpi = 300)
+  
+  ## 2024
+  #ggsave(paste("P1_plots/1_Flows/flow_citizenship/2024/", i, ".png", sep = ""), 
+  #       f_plotappendix_flow(observed.unit = i, years = 2024, alpha = 0.01), width = 3.4, height = 2.5, units = "in", dpi = 300)
+  
+  ## 2023 & 2024
+  ggsave(paste("P1_plots/1_Flows/flow_citizenship/2023_2024/", i, ".png", sep = ""), 
+         f_plotappendix_flow(observed.unit = i, years = c(2023, 2024), alpha = 0.01), width = 3.4, height = 2.5, units = "in", dpi = 300)
+}
+
+## Age Cohort
+for (i in unique(filtered_data$age_category)){
+  ## 2023
+  #ggsave(paste("P1_plots/draft_flow_age_cohort/2023/", i, ".png", sep = ""), 
+  #       f_plotappendix_flow(observed.unit = i, years = 2023, alpha = 0.01), width = 3.4, height = 2.5, units = "in", dpi = 300)
+  
+  ## 2024
+  #ggsave(paste("P1_plots/draft_flow_age_cohort/2024/", i, ".png", sep = ""), 
+  #       f_plotappendix_flow(observed.unit = i, years = 2024, alpha = 0.01), width = 3.4, height = 2.5, units = "in", dpi = 300)
+  
+  ## 2023 & 2024
+  ggsave(paste("P1_plots/draft_flow_age_cohort/2023_2024/", i, ".png", sep = ""), 
+         f_plotappendix_flow(observed.unit = i, years = c(2023, 2024), alpha = 0.01), width = 3.4, height = 2.5, units = "in", dpi = 300)
+}
+```
+```{r Plot Heatmap, include = FALSE, eval = FALSE}
+ggsave(
+  filename = "P1_plots/heatmap.pdf", 
+  plot = f_plotappendix_heatmap(projection.days = 1),
+  width = 30, 
+  height = 20,
+  units = "cm",
+  device = "pdf"
+)
+
+ggsave(
+  filename = "P1_plots/map_young_adults.pdf", 
+  plot = f_plotappendix_map("Young Adults"),
+  width = 30, 
+  height = 20,
+  units = "cm",
+  device = "pdf"
+)
+
+ggsave(
+  filename = "P1_plots/map_older_adults.pdf", 
+  plot = f_plotappendix_map("Older Adults"),
+  width = 30, 
+  height = 20,
+  units = "cm",
+  device = "pdf"
+)
+```
+```{r Plot Maps, include = FALSE, eval = FALSE}
+## Maps
+for (i in unique(filtered_data$age_category)){
+  ## 2023
+  ggsave(
+    filename = paste("P1_plots/2_Maps/2023/", i, ".png", sep = ""),
+    plot = f_plotappendix_map(group_name = i, years = 2023),
+    width = 38,
+    height = 15,,
+    units = "cm",
+    dpi = 600,
+    bg = "white"
+  )
+  
+  ## 2024
+  ggsave(
+    filename = paste("P1_plots/2_Maps/2024/", i, ".png", sep = ""),
+    plot = f_plotappendix_map(group_name = i, years = 2024),
+    width = 38,
+    height = 15,
+    units = "cm",
+    dpi = 600,
+    bg = "white"
+  )
+  
+  ## 2023 & 2024
+  ggsave(
+    filename = paste("P1_plots/2_Maps/2023_2024/", i, ".png", sep = ""),
+    plot = f_plotappendix_map(group_name = i),
+    width = 38,
+    height = 15,
+    units = "cm",
+    dpi = 600,
+    bg = "white"
+  )
+}
+
+## Heatmap
+f_plotappendix_heatmap()
+```
+```{r Test Assortativity, include = FALSE, eval = FALSE}
+f_error_assortativity <- function(observed.unit, n.runs = 100, filter.arrivals = TRUE, arrivals.filter = 0){
+  arrivals <- f_generate_matrix(observed.unit = observed.unit, filter = "municipality_code", data = filtered_data) %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  exits <- f_generate_matrix(observed.unit = observed.unit, filter = "municipality_code", data = filtered_data, type = "exits") %>% {.[, year(colnames(.)) %in% c(2023, 2024)]}
+  
+  diaspora <- {{f_generate_matrix(observed.unit = observed.unit, filter = "municipality_code", data = filtered_data, filter.births = FALSE) %>%
+        {.[, year(colnames(.)) %in% c(2022)]}} -
+    {f_generate_matrix(observed.unit = observed.unit, filter = "municipality_code", type = "exits", filter.deaths = FALSE, data = filtered_data) %>%
+        {.[, year(colnames(.)) %in% c(2022)]}}} %>% rowSums()
+  
+  ## One internal move and exit between initialisation and end of 2022 => thus, exit from municipality with diaspora = 0
+  if(observed.unit == "IN"){
+    diaspora[which(diaspora < 0)] <- 0
+  }
+  
+  diaspora_share <- diaspora/sum(diaspora)
+  
+  if(filter.arrivals){
+    filter.municipalities <- arrivals %>% rowSums() %>% {names(.[. > arrivals.filter])}
+    
+    arrivals <- arrivals[filter.municipalities, ]
+    exits <- exits[filter.municipalities, ]
+    
+    diaspora_share <- diaspora_share[filter.municipalities]
+  }
+  
+  population <- municipalities$population_2023[match(as.integer(names(diaspora_share)), municipalities$municipality_code)]
+  population_share <- population/sum(population)
+  
+  diff_diaspora_arrivals <- c() 
+  diff_diaspora_exits <- c()
+  diff_population_arrivals <- c() 
+  diff_population_exits <- c()
+  
+  
+  for (i in 1:ncol(arrivals)){
+    modelled_diaspora_arrivals <- rmultinom(n = n.runs, size = colSums(arrivals)[i], prob = diaspora_share)
+    modelled_diaspora_exits <- rmultinom(n = n.runs, size = colSums(arrivals)[i], prob = diaspora_share)
+    
+    modelled_population_arrivals <- rmultinom(n = n.runs, size = colSums(arrivals)[i], prob = population_share)
+    modelled_population_exits <- rmultinom(n = n.runs, size = colSums(arrivals)[i], prob = population_share)
+    
+    diff_diaspora_arrivals <- cbind(diff_diaspora_arrivals, modelled_diaspora_arrivals - arrivals[, i])
+    diff_diaspora_exits <- cbind(diff_diaspora_exits, modelled_diaspora_exits - exits[, i])
+    
+    diff_population_arrivals <- cbind(diff_population_arrivals, modelled_population_arrivals - arrivals[, i])
+    diff_population_exits <- cbind(diff_population_exits, modelled_population_exits - exits[, i])
+  }
+
+    daily_error_diaspora_arrivals <- sqrt(sum(diff_diaspora_arrivals^2))/(length(diaspora) * ncol(arrivals))
+    daily_error_diaspora_exits <- sqrt(sum(diff_diaspora_exits^2))/(length(diaspora) * ncol(exits))
+    
+    daily_error_population_arrivals <- sqrt(sum(diff_population_arrivals^2))/(length(population) * ncol(arrivals))
+    daily_error_population_exits <- sqrt(sum(diff_population_exits^2))/(length(population) * ncol(exits))   
+  
+  
+  return(c(
+    daily_error_diaspora_arrivals = daily_error_diaspora_arrivals, 
+    daily_error_diaspora_exits = daily_error_diaspora_exits, 
+    daily_error_population_arrivals = daily_error_population_arrivals, 
+    daily_error_population_exits = daily_error_population_exits)
+    )
+}
+
+## By Citizenship
+error_assortativity_citizenship <- c()
+
+for(i in top_25_diaspora){
+  error_assortativity_citizenship <- rbind(error_assortativity_citizenship, 
+                                           i = f_error_assortativity(i, n.runs = 100, arrivals.filter = 5))
+}
+
+## By Age-Cohort
+error_assortativity_age_cohort <- c()
+
+for (i in c("Children", "Young Adults", "Middle-Aged Adults", "Older Adults", "Seniors")){
+  error_assortativity_age_cohort <- rbind(error_assortativity_age_cohort, 
+                                           i = f_error_assortativity(i, n.runs = 100, arrivals.filter = 5))
+}
+```
+```{r Plot Assortativity, include = FALSE, eval = FALSE}
+## Top 25 Diaspora
+for (i in top_25_diaspora){
+    # Suppress warnings from log10, etc.
+    p1 <- suppressWarnings(f_plotappendix_assortativity(i))
+    p2 <- suppressWarnings(f_plotappendix_assortativity(i, type = "exits"))
+    
+    # Create the combined plot without internal labels
+    combined_plot <- plot_grid(
+      p1, p2,
+      labels = NULL,
+      ncol = 2,
+      align = 'hv'
+    )
+    
+    # Create a bold title in the same size as axis/tick labels
+    title <- ggdraw() +
+      draw_label(
+        countrycode(i, "iso2c", "country.name", custom_match = c("XK" = "Kosovo")),
+        fontface = "bold",
+        hjust = 0.5,
+        size = 14
+      )
+    
+    # Stack the title on top of the plot
+    final_plot <- plot_grid(
+      title, combined_plot,
+      ncol = 1,
+      rel_heights = c(0.1, 1)  # Allocate space for title
+    )
+    
+    # Save
+    ggsave(
+      filename = paste("P1_plots/4_Assortativity/1_Citizenship/", i, ".png", sep = ""),
+      plot = final_plot,
+      width = 10,          
+      height = 5.5,
+      dpi = 300,
+      bg = "white"
+    )
+    
+    rm(list = c("p1", "p2", "combined_plot", "title", "final_plot"))
+}
+
+## Age Cohort
+for (i in c("Children", "Young Adults", "Middle-Aged Adults", "Older Adults", "Seniors")){
+    # Suppress warnings from log10, etc.
+    p1 <- suppressWarnings(f_plotappendix_assortativity(i))
+    p2 <- suppressWarnings(f_plotappendix_assortativity(i, type = "exits"))
+    
+    # Create the combined plot without internal labels
+    combined_plot <- plot_grid(
+      p1, p2,
+      labels = NULL,
+      ncol = 2,
+      align = 'hv'
+    )
+    
+    # Create a bold title in the same size as axis/tick labels
+    title <- ggdraw() +
+      draw_label(
+        i,
+        fontface = "bold",
+        hjust = 0.5,
+        size = 14
+      )
+    
+    # Stack the title on top of the plot
+    final_plot <- plot_grid(
+      title, combined_plot,
+      ncol = 1,
+      rel_heights = c(0.1, 1)  # Allocate space for title
+    )
+    
+    # Save
+    ggsave(
+      filename = paste("P1_plots/4_Assortativity/2_Age_Cohort/", i, ".png", sep = ""),
+      plot = final_plot,
+      width = 10,          
+      height = 5.5,
+      dpi = 300,
+      bg = "white"
+    )
+    
+    rm(list = c("p1", "p2", "combined_plot", "title", "final_plot"))
+}
+```
+```{r Flow Errors, include = FALSE, eval = FALSE}
+## Citizenship
+ggsave(
+  filename = paste("P1_plots/5_Flow_Errors/", "singular_citizenship", ".png", sep = ""),
+  plot = f_plotappendix_flow_stability_error("singular_citizenship"),
+  width = 10,          
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+## Age-Cohort
+ggsave(
+  filename = paste("P1_plots/5_Flow_Errors/", "age_cohort", ".png", sep = ""),
+  plot = f_plotappendix_flow_stability_error("age_category"),
+  width = 10,          
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+
+## State Urbanisation
+ggsave(
+  filename = paste("P1_plots/5_Flow_Errors/", "state_urbanisation", ".png", sep = ""),
+  plot = f_plotappendix_flow_stability_error("state_urbanisation"),
+  width = 10,          
+  height = 5.5,
+  dpi = 300,
+  bg = "white"
+)
+```
+```{r Flow Stability, include = FALSE, eval = FALSE}
+## Citizenship
+for (i in top_25_diaspora){
+  ggsave(
+    filename = paste("P1_plots/6_Flow_Stability/1_Citizenship/", i, ".png", sep = ""),
+    plot = f_plotappendix_flow_stability(i), 
+    width = 6.8, 
+    height = 5, 
+    units = "in", 
+    dpi = 300, 
+    bg = "white"
+  )
+}
+
+## Age Cohort
+for (i in c("Children", "Young Adults", "Middle-Aged Adults", "Older Adults", "Seniors")){
+  ggsave(
+    filename = paste("P1_plots/6_Flow_Stability/2_Age_Cohort/", i, ".png", sep = ""),
+    plot = f_plotappendix_flow_stability(i, if.country = FALSE),
+    width = 6.8, 
+    height = 5, 
+    units = "in", 
+    dpi = 300, 
+    bg = "white"
+  )
+}
+
+## State Urbanisation
+for (i in unique(filtered_data$state_urbanisation)){
+  ggsave(
+    filename = paste("P1_plots/6_Flow_Stability/3_State_Urbanisation/", i, ".png", sep = ""),
+    plot = f_plotappendix_flow_stability(i, if.country = FALSE),
+    width = 6.8, 
+    height = 5, 
+    units = "in", 
+    dpi = 300, 
+    bg = "white"
+  )
+}
+```
