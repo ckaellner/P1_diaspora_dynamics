@@ -1,5 +1,5 @@
 # Analysing arrival/exit dynamics of migrants in and to Austria
-Carsten Källner - 2024-10-22
+Carsten Källner - 2025-12-12
 
 This repository contains an R Markdown workflow to analyse arrival, exit, and (optionally) internal movement dynamics of migrants in Austria using administrative residence spell data. It connects to a PostgreSQL data warehouse, builds daily flow matrices (arrivals/exits), fits simple Poisson-based flow parameters (Skellam-style net dynamics), and produces a set of plots and bivariate maps for exploratory and descriptive analysis.
 
